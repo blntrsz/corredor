@@ -81,21 +81,23 @@ export namespace Agent {
   export type Event =
     | {
       readonly type: "ToolCall"
+      readonly id: string
       readonly name: string
       readonly input: unknown
     }
     | {
       readonly type: "ToolResult"
+      readonly id: string
       readonly name: string
       readonly result: unknown
       readonly isFailure: boolean
     }
 
   export interface Runner {
-    readonly run: (
+    readonly run: <E = never, R = never>(
       prompt: string,
-      onEvent?: (event: Event) => void
-    ) => Effect.Effect<string, Error>
+      onEvent?: (event: Event) => Effect.Effect<void, E, R>
+    ) => Effect.Effect<string, Error | E, R>
   }
 
   export interface Interface {
@@ -119,27 +121,30 @@ export namespace Agent {
         ...history
       ])
 
-      const run = Effect.fn("Agent.run")(
-        function*(prompt: string, onEvent?: (event: Event) => void) {
+      const run: Runner["run"] = (prompt, onEvent) => Effect.gen(function*() {
         for (let turn = 0; turn < maxTurns; turn++) {
           const response = yield* chat.generateText({
             prompt: turn === 0 ? prompt : [],
             toolkit
           }).pipe(
-            Effect.provideService(LanguageModel.LanguageModel, languageModel)
+            Effect.provideService(LanguageModel.LanguageModel, languageModel),
+            Effect.catchTag("AiError", (error) =>
+              Effect.fail(new ModelError({ reason: error.reason })))
           )
 
           if (onEvent !== undefined) {
             for (const part of response.content) {
               if (part.type === "tool-call") {
-                onEvent({
+                yield* onEvent({
                   type: "ToolCall",
+                  id: part.id,
                   name: part.name,
                   input: part.params
                 })
               } else if (part.type === "tool-result") {
-                onEvent({
+                yield* onEvent({
                   type: "ToolResult",
+                  id: part.id,
                   name: part.name,
                   result: part.result,
                   isFailure: part.isFailure
@@ -154,11 +159,7 @@ export namespace Agent {
         }
 
         return yield* new TurnLimitExceeded({ maxTurns })
-      },
-        semaphore.withPermits(1),
-        Effect.catchTag("AiError", (error) =>
-          Effect.fail(new ModelError({ reason: error.reason })))
-      )
+      }).pipe(semaphore.withPermits(1))
       return { run }
     })
 

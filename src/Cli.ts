@@ -1,11 +1,11 @@
 import { BunRuntime, BunServices } from "@effect/platform-bun"
-import { Effect, Layer, Option } from "effect"
+import { Effect, Option } from "effect"
 import { Argument, Command, Flag } from "effect/unstable/cli"
-import { Agent } from "./Agent.ts"
+import * as AgentProxy from "./AgentProxy.ts"
 import { Harness } from "./Harness.ts"
 import * as Server from "./Server.ts"
+import { defaultServerPort, defaultServerUrl, ensureServer } from "./ServerManager.ts"
 import * as Session from "./Session.ts"
-import * as SessionWorkflow from "./SessionWorkflow.ts"
 
 const formatTsvValue = (value: unknown): string => {
   if (value === null || value === undefined) return ""
@@ -60,7 +60,7 @@ const serverCommand = Command.make(
       Flag.withDescription("The host address to bind")
     ),
     port: Flag.integer("port").pipe(
-      Flag.withDefault(4096),
+      Flag.withDefault(defaultServerPort),
       Flag.withDescription("The port to listen on")
     )
   },
@@ -78,6 +78,10 @@ const command = Command.make(
     )
   },
   Effect.fn("Cli.run")(function*({ prompt }) {
+    yield* Effect.tryPromise({
+      try: () => ensureServer(import.meta.path),
+      catch: (cause) => new Error("Unable to start the Corredor server", { cause })
+    }).pipe(Effect.orDie)
     yield* Harness.run(Option.getOrUndefined(prompt))
   })
 ).pipe(
@@ -97,9 +101,7 @@ const command = Command.make(
 
 command.pipe(
   Command.run({ version: "0.1.0" }),
-  Effect.provide(SessionWorkflow.layer.pipe(
-    Layer.provide([Agent.layer, Session.layer()])
-  )),
+  Effect.provide(AgentProxy.layer({ baseUrl: defaultServerUrl })),
   Effect.provide(BunServices.layer),
   BunRuntime.runMain
 )
