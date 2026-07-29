@@ -1,0 +1,25 @@
+{
+  "name": "corredor",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "agent": "bun run src/Cli.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@earendil-works/pi-tui": "0.82.1",
+    "@effect/ai-openai-compat": "^4.0.0-beta.102",
+    "@effect/platform-bun": "4.0.0-beta.102",
+    "@effect/sql-sqlite-bun": "4.0.0-beta.102",
+    "effect": "4.0.0-beta.102"
+  },
+  "patchedDependencies": {
+    "@effect/ai-openai-compat@4.0.0-beta.102": "patches/@effect%2Fai-openai-compat@4.0.0-beta.102.patch"
+  }
+}

@@ -1,0 +1,59 @@
+diff --git a/dist/OpenAiLanguageModel.js b/dist/OpenAiLanguageModel.js
+index 175dbf1e47c4ef428ece06eee26f495bb29935a7..b50b96752b008e2d6d5983b3f8e8725c48d488b4 100644
+--- a/dist/OpenAiLanguageModel.js
++++ b/dist/OpenAiLanguageModel.js
+@@ -1121,7 +1121,17 @@ const toChatMessages = input => {
+   }
+   const messages = [];
+   for (const item of input) {
+-    messages.push(...toChatMessagesFromItem(item));
++    const converted = toChatMessagesFromItem(item);
++    const previous = messages[messages.length - 1];
++    const next = converted[0];
++    if (converted.length === 1 && previous?.role === "assistant" && "tool_calls" in previous && previous.tool_calls !== undefined && next?.role === "assistant" && "tool_calls" in next && next.tool_calls !== undefined) {
++      messages[messages.length - 1] = {
++        ...previous,
++        tool_calls: [...previous.tool_calls, ...next.tool_calls]
++      };
++    } else {
++      messages.push(...converted);
++    }
+   }
+   return messages;
+ };
+diff --git a/src/OpenAiLanguageModel.ts b/src/OpenAiLanguageModel.ts
+index fc5b21109324f6579d17cf2e441877ed5a2c9b9d..0c13accb78c8b1eb3ae94edab6e8a63393fae975 100644
+--- a/src/OpenAiLanguageModel.ts
++++ b/src/OpenAiLanguageModel.ts
+@@ -1724,7 +1724,30 @@ const toChatMessages = (
+   const messages: Array<CreateResponseRequestJson["messages"][number]> = []
+ 
+   for (const item of input) {
+-    messages.push(...toChatMessagesFromItem(item))
++    const converted = toChatMessagesFromItem(item)
++    const previous = messages[messages.length - 1]
++    const next = converted[0]
++
++    // The Responses API represents every function call as a separate item,
++    // while Chat Completions requires parallel calls from one assistant turn
++    // to share a single assistant message. Keep consecutive calls grouped so
++    // all following tool messages respond to that one assistant message.
++    if (
++      converted.length === 1 &&
++      previous?.role === "assistant" &&
++      "tool_calls" in previous &&
++      previous.tool_calls !== undefined &&
++      next?.role === "assistant" &&
++      "tool_calls" in next &&
++      next.tool_calls !== undefined
++    ) {
++      messages[messages.length - 1] = {
++        ...previous,
++        tool_calls: [...previous.tool_calls, ...next.tool_calls]
++      }
++    } else {
++      messages.push(...converted)
++    }
+   }
+ 
+   return messages
