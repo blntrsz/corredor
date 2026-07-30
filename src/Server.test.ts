@@ -98,7 +98,7 @@ it.live(
       ...result.activity
     ])
     expect(result.history.branchHeadId).toBe(
-      Session.graphEntryId(result.activity[2] as Session.GraphEntry)
+      Session.branchRecordId(result.activity[2] as Session.BranchRecord)
     )
     expect(result.checkedOut.branchHeadId).toBe("http-user")
     expect(result.checkedOut.items).toEqual(result.history.items)

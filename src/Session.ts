@@ -81,7 +81,7 @@ export interface LegacyNavigation {
 }
 
 export type HistoryItem = Commit | LegacyToolCall | SessionCreated | LegacyNavigation
-export type GraphEntry = Commit | LegacyToolCall
+export type BranchRecord = Commit | LegacyToolCall
 
 export interface HistorySnapshot {
   readonly items: ReadonlyArray<HistoryItem>
@@ -235,11 +235,11 @@ export const isCommit = (item: HistoryItem): item is Commit =>
   item.type === "ToolCommit" ||
   item.type === "AgentMessageCommit"
 
-export const isGraphEntry = (item: HistoryItem): item is GraphEntry =>
+export const isBranchRecord = (item: HistoryItem): item is BranchRecord =>
   isCommit(item) || item.type === "LegacyToolCall"
 
-export const graphEntryId = (entry: GraphEntry): string =>
-  entry.type === "LegacyToolCall" ? entry.legacyId : entry.commitId
+export const branchRecordId = (record: BranchRecord): string =>
+  record.type === "LegacyToolCall" ? record.legacyId : record.commitId
 
 export const historyItemId = (item: HistoryItem): string => {
   if (isCommit(item)) return item.commitId
@@ -248,7 +248,7 @@ export const historyItemId = (item: HistoryItem): string => {
 }
 
 export interface CommitNode {
-  readonly entry: GraphEntry
+  readonly record: BranchRecord
   readonly parentId: string | null
 }
 
@@ -276,10 +276,10 @@ export const commitGraph = (
         : headId
       continue
     }
-    if (!isGraphEntry(item)) continue
+    if (!isBranchRecord(item)) continue
 
-    nodes.push({ entry: item, parentId: item.parentId })
-    const id = graphEntryId(item)
+    nodes.push({ record: item, parentId: item.parentId })
+    const id = branchRecordId(item)
     ids.add(id)
     if (item.parentId === headId) headId = id
   }
@@ -293,14 +293,16 @@ export const commitGraph = (
   return { nodes, headId }
 }
 
-/** Returns the root-to-head context entries for a Branch. */
+/** Returns the root-to-head context records for a Branch. */
 export const branchHistory = (
   history: ReadonlyArray<HistoryItem>,
   requestedHeadId?: string | null
-): ReadonlyArray<GraphEntry> => {
+): ReadonlyArray<BranchRecord> => {
   const graph = commitGraph(history)
-  const byId = new Map(graph.nodes.map((node) => [graphEntryId(node.entry), node] as const))
-  const branch: Array<GraphEntry> = []
+  const byId = new Map(graph.nodes.map(
+    (node) => [branchRecordId(node.record), node] as const
+  ))
+  const branch: Array<BranchRecord> = []
   let id = requestedHeadId === undefined ? graph.headId : requestedHeadId
   const visited = new Set<string>()
 
@@ -308,7 +310,7 @@ export const branchHistory = (
     visited.add(id)
     const node = byId.get(id)
     if (node === undefined) break
-    branch.push(node.entry)
+    branch.push(node.record)
     id = node.parentId
   }
 
@@ -524,13 +526,13 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       VALUES (${sessionId}, ${commitGraph(history).headId})`.pipe(persist)
   }
 
-  const insert = (
+  const insert = Effect.fn("Session.insert")(function*(
     sessionId: string,
     eventId: string,
     type: RawEventType,
     payload: Record<string, unknown>,
     sequence: number
-  ) => Effect.gen(function*() {
+  ) {
     const occurredAt = new Date(yield* Clock.currentTimeMillis).toISOString()
     yield* sql`INSERT INTO session_events (event_id, session_id, sequence, event_type, payload, occurred_at)
       VALUES (${eventId}, ${sessionId}, ${sequence}, ${type}, ${JSON.stringify(payload)}, ${occurredAt})`
@@ -562,11 +564,14 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     inReplyTo: string
   ): string => {
     const toolEntries = history.filter(
-      (item): item is Extract<GraphEntry, { readonly type: "ToolCommit" | "LegacyToolCall" }> =>
+      (item): item is Extract<
+        BranchRecord,
+        { readonly type: "ToolCommit" | "LegacyToolCall" }
+      > =>
         (item.type === "ToolCommit" || item.type === "LegacyToolCall") &&
         item.inReplyTo === inReplyTo
     )
-    return toolEntries.map(graphEntryId).at(-1) ?? inReplyTo
+    return toolEntries.map(branchRecordId).at(-1) ?? inReplyTo
   }
 
   return Service.of({
@@ -644,7 +649,10 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
             ? { type: "Appended" as const, item: existing }
             : { type: "ToolCommitConflict" as const }
         }
-        if (!history.some((item) => isGraphEntry(item) && graphEntryId(item) === inReplyTo)) {
+        if (!history.some(
+          (item) => isBranchRecord(item) &&
+            branchRecordId(item) === inReplyTo
+        )) {
           return { type: "CommitNotFound" as const, commitId: inReplyTo }
         }
         const parentId = responseParent(history, inReplyTo)
@@ -682,8 +690,8 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
             return { type: "Appended" as const, item: existing }
           }
           if (!history.some(
-            (item) => isGraphEntry(item) &&
-              graphEntryId(item) === inReplyTo
+            (item) => isBranchRecord(item) &&
+              branchRecordId(item) === inReplyTo
           )) {
             return { type: "CommitNotFound" as const, commitId: inReplyTo }
           }
@@ -722,7 +730,7 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       if (rows.length === 0) return yield* new NotFound({ sessionId })
       const history = decodeHistory(rows)
       if (commitId !== null && !history.some(
-        (item) => isGraphEntry(item) && graphEntryId(item) === commitId
+        (item) => isBranchRecord(item) && branchRecordId(item) === commitId
       )) {
         return yield* new CommitNotFound({ sessionId, commitId })
       }

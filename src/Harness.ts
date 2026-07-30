@@ -16,7 +16,7 @@ import {
   truncateToWidth,
   TUI
 } from "@earendil-works/pi-tui"
-import { Effect, Stream } from "effect"
+import { Crypto, Effect, Stream } from "effect"
 import * as AgentProxy from "./AgentProxy.ts"
 import * as Session from "./Session.ts"
 import type { HistoryItem, SessionSummary } from "./Session.ts"
@@ -133,10 +133,8 @@ class SessionPicker implements Component, Focusable {
   invalidate(): void {}
 }
 
-type TreeEntryEvent = Session.GraphEntry
-
-interface TreeEntryItem {
-  readonly event: TreeEntryEvent
+interface HistoryTreeItem {
+  readonly record: Session.BranchRecord
   readonly parentId: string | null
   /** Tree guides are added only where a parent has multiple children. */
   readonly treePrefix: string
@@ -147,18 +145,18 @@ interface TreeEntryItem {
 class TreePicker implements Component, Focusable {
   focused = false
   private selected = 0
-  private readonly items: ReadonlyArray<TreeEntryItem>
+  private readonly items: ReadonlyArray<HistoryTreeItem>
 
   constructor(
-    events: ReadonlyArray<HistoryItem>,
+    history: ReadonlyArray<HistoryItem>,
     branchHeadId: string | null,
-    private readonly onSelect: (item: TreeEntryItem) => void,
+    private readonly onSelect: (item: HistoryTreeItem) => void,
     private readonly onCancel: () => void,
     private readonly requestRender: () => void
   ) {
-    const tree = Session.commitGraph(events, branchHeadId)
+    const tree = Session.commitGraph(history, branchHeadId)
     const byId = new Map(tree.nodes.map(
-      (node) => [Session.graphEntryId(node.entry), node] as const
+      (node) => [Session.branchRecordId(node.record), node] as const
     ))
     const activeIds = new Set<string>()
     let activeId = tree.headId
@@ -174,7 +172,7 @@ class TreePicker implements Component, Focusable {
       children.set(node.parentId, siblings)
     }
 
-    const items: Array<TreeEntryItem> = []
+    const items: Array<HistoryTreeItem> = []
     const visit = (parentId: string | null, ancestorGutters: ReadonlyArray<boolean>) => {
       const nodes = children.get(parentId) ?? []
       const branchesHere = nodes.length > 1
@@ -184,16 +182,16 @@ class TreePicker implements Component, Focusable {
           .map((hasLaterSibling) => hasLaterSibling ? "│  " : "   ")
           .join("")
         items.push({
-          event: node.entry,
+          record: node.record,
           parentId: node.parentId,
           treePrefix: branchesHere
             ? `${ancestorPrefix}${isLastBranch ? "└─ " : "├─ "}`
             : ancestorPrefix,
-          active: activeIds.has(Session.graphEntryId(node.entry)),
-          current: Session.graphEntryId(node.entry) === tree.headId
+          active: activeIds.has(Session.branchRecordId(node.record)),
+          current: Session.branchRecordId(node.record) === tree.headId
         })
         visit(
-          Session.graphEntryId(node.entry),
+          Session.branchRecordId(node.record),
           branchesHere
             ? [...ancestorGutters, !isLastBranch]
             : ancestorGutters
@@ -240,21 +238,21 @@ class TreePicker implements Component, Focusable {
       const selected = index === this.selected
       const cursor = selected ? cyan("›") : " "
       const marker = item.current ? green("◆") : item.active ? cyan("●") : dim("○")
-      const [role, rawContent] = item.event.type === "UserCommit"
-        ? [cyan("You"), item.event.content]
-        : item.event.type === "AgentMessageCommit"
-        ? [green("Agent"), item.event.content]
-        : item.event.type === "ToolCommit"
+      const [role, rawContent] = item.record.type === "UserCommit"
+        ? [cyan("You"), item.record.content]
+        : item.record.type === "AgentMessageCommit"
+        ? [green("Agent"), item.record.content]
+        : item.record.type === "ToolCommit"
         ? [
-          dim(`Tool Commit · ${item.event.name}`),
+          dim(`Tool Commit · ${item.record.name}`),
           JSON.stringify({
-            input: item.event.input,
-            outcome: item.event.outcome
+            input: item.record.input,
+            outcome: item.record.outcome
           })
         ]
         : [
-          dim(`Legacy Tool Record · ${item.event.name}`),
-          JSON.stringify({ input: item.event.input, result: "not persisted" })
+          dim(`Legacy Tool Record · ${item.record.name}`),
+          JSON.stringify({ input: item.record.input, result: "not persisted" })
         ]
       const content = (rawContent ?? "").replace(/\s+/g, " ").trim() || "(empty)"
       const line = `  ${cursor} ${marker} ${item.treePrefix}${role}: ${content}`
@@ -281,7 +279,12 @@ interface Handle {
 const formatError = (error: unknown): string =>
   error instanceof Error ? error.message : String(error)
 
-const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialPrompt?: string): Handle => {
+const make = (
+  proxy: AgentProxy.Interface,
+  randomCommitId: Effect.Effect<string, unknown>,
+  initialSessionId: string,
+  initialPrompt?: string
+): Handle => {
   const tui = new TUI(new ProcessTerminal())
   const app = new Container()
   const messages = new Container()
@@ -358,26 +361,30 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
     messages.addChild(new Spacer(1))
   }
 
-  const addToolEntry = (
-    entry: Extract<Session.GraphEntry, {
+  const addToolRecord = (
+    record: Extract<Session.BranchRecord, {
       readonly type: "ToolCommit" | "LegacyToolCall"
     }>
   ) => {
-    const params = entry.input as { readonly command?: unknown }
-    const detail = entry.name === "Bash" && typeof params.command === "string"
+    const params = record.input as { readonly command?: unknown }
+    const detail = record.name === "Bash" && typeof params.command === "string"
       ? JSON.stringify(params.command)
-      : JSON.stringify(entry.input)
-    const label = entry.type === "ToolCommit" ? "Tool Commit" : "Legacy Tool Record"
+      : JSON.stringify(record.input)
+    const label = record.type === "ToolCommit"
+      ? "Tool Commit"
+      : "Legacy Tool Record"
     messages.addChild(
-      new Text(bold(dim(`${label} · ${entry.name}(${detail})`)), 1, 0)
+      new Text(bold(dim(`${label} · ${record.name}(${detail})`)), 1, 0)
     )
-    if (entry.type === "ToolCommit") {
-      const outcome = entry.outcome.type === "Success"
-        ? entry.outcome.result
-        : entry.outcome.failure
-      const outcomeLabel = entry.outcome.type === "Success" ? "Result" : "Failure"
+    if (record.type === "ToolCommit") {
+      const outcome = record.outcome.type === "Success"
+        ? record.outcome.result
+        : record.outcome.failure
+      const outcomeLabel = record.outcome.type === "Success"
+        ? "Result"
+        : "Failure"
       messages.addChild(new Text(
-        entry.outcome.type === "Success"
+        record.outcome.type === "Success"
           ? dim(`${outcomeLabel}: ${JSON.stringify(outcome)}`)
           : red(`${outcomeLabel}: ${JSON.stringify(outcome)}`),
         1,
@@ -395,12 +402,12 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
   const renderMessages = () => {
     messages.clear()
     const history = orderedHistory()
-    for (const entry of Session.branchHistory(history, branchHeadId)) {
-      if (entry.type === "UserCommit") addUserMessage(entry.content)
-      else if (entry.type === "AgentMessageCommit") {
-        addAssistantMessage(entry.content)
+    for (const record of Session.branchHistory(history, branchHeadId)) {
+      if (record.type === "UserCommit") addUserMessage(record.content)
+      else if (record.type === "AgentMessageCommit") {
+        addAssistantMessage(record.content)
       } else {
-        addToolEntry(entry)
+        addToolRecord(record)
       }
     }
 
@@ -441,10 +448,10 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
     if (knownItems.has(itemId)) return
     knownItems.set(itemId, item)
     if (
-      Session.isGraphEntry(item) &&
+      Session.isBranchRecord(item) &&
       item.parentId === branchHeadId
     ) {
-      branchHeadId = Session.graphEntryId(item)
+      branchHeadId = Session.branchRecordId(item)
     }
 
     if (item.type === "UserCommit" && pending?.commitId === item.commitId) {
@@ -561,14 +568,14 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
         (item) => {
           if (navigating) return
           navigating = true
-          const targetId = item.event.type === "UserCommit"
+          const targetId = item.record.type === "UserCommit"
             ? item.parentId
-            : Session.graphEntryId(item.event)
+            : Session.branchRecordId(item.record)
           void Effect.runPromise(proxy.checkout(treeSessionId, targetId)).then(() => {
             if (stopped || sessionId !== treeSessionId) return
             branchHeadId = targetId
             editor.setText(
-              item.event.type === "UserCommit" ? item.event.content : ""
+              item.record.type === "UserCommit" ? item.record.content : ""
             )
             renderMessages()
             showConversation()
@@ -600,32 +607,40 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
     if (prompt === "/resume") return resumeSession()
     if (prompt === "/history" || prompt === "/tree") return openTree()
 
-    const commitId = crypto.randomUUID()
-    pending = { commitId, content: prompt }
     editor.addToHistory(prompt)
     editor.disableSubmit = true
 
-    const loader = new Loader(tui, cyan, dim, "Thinking...")
-    activeLoader = loader
-    loader.start()
-    renderMessages()
+    void Effect.runPromise(randomCommitId).then((commitId) => {
+      if (stopped) return
+      pending = { commitId, content: prompt }
 
-    const controller = new AbortController()
-    activeController = controller
-    tui.requestRender()
+      const loader = new Loader(tui, cyan, dim, "Thinking...")
+      activeLoader = loader
+      loader.start()
+      renderMessages()
 
-    void Effect.runPromise(
-      proxy.submitUserCommit(sessionId, prompt, commitId),
-      { signal: controller.signal }
-    ).then((commit) => {
-      if (stopped || controller.signal.aborted) return
-      if (activeController === controller) activeController = undefined
-      if (pending?.commitId === commitId) {
-        pending.inReplyTo ??= commit.commitId
-      }
+      const controller = new AbortController()
+      activeController = controller
+      tui.requestRender()
+
+      return Effect.runPromise(
+        proxy.submitUserCommit(sessionId, prompt, commitId),
+        { signal: controller.signal }
+      ).then((commit) => {
+        if (stopped || controller.signal.aborted) return
+        if (activeController === controller) activeController = undefined
+        if (pending?.commitId === commitId) {
+          pending.inReplyTo ??= commit.commitId
+        }
+      }).catch((error: unknown) => {
+        if (stopped || controller.signal.aborted) return
+        if (pending?.commitId === commitId) pending = undefined
+        finish()
+        addErrorMessage(formatError(error))
+        tui.requestRender()
+      })
     }).catch((error: unknown) => {
-      if (stopped || controller.signal.aborted) return
-      if (pending?.commitId === commitId) pending = undefined
+      if (stopped) return
       finish()
       addErrorMessage(formatError(error))
       tui.requestRender()
@@ -656,12 +671,17 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
 }
 
 export namespace Harness {
-  export const run = (initialPrompt?: string): Effect.Effect<void, never, AgentProxy.Service> =>
+  export const run = (
+    initialPrompt?: string
+  ): Effect.Effect<void, never, AgentProxy.Service | Crypto.Crypto> =>
     Effect.gen(function*() {
       const proxy = yield* AgentProxy.Service
+      const crypto = yield* Crypto.Crypto
       const session = yield* proxy.createSession().pipe(Effect.orDie)
       yield* Effect.acquireUseRelease(
-        Effect.sync(() => make(proxy, session.sessionId, initialPrompt)),
+        Effect.sync(() =>
+          make(proxy, crypto.randomUUIDv4, session.sessionId, initialPrompt)
+        ),
         (handle) => Effect.promise(() => handle.done),
         (handle) => Effect.sync(handle.stop)
       )

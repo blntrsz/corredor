@@ -101,9 +101,9 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
   const execute = (request: HttpClientRequest.HttpClientRequest) =>
     client.execute(request).pipe(Effect.mapError(proxyError))
 
-  const responseJson = (
+  const responseJson = Effect.fn("AgentProxy.responseJson")(function*(
     request: HttpClientRequest.HttpClientRequest
-  ): Effect.Effect<unknown, ProxyError> => Effect.gen(function*() {
+  ) {
     const response = yield* execute(request)
     if (response.status < 200 || response.status >= 300) {
       const detail = yield* response.text.pipe(
@@ -118,8 +118,8 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
     return yield* response.json.pipe(Effect.mapError(proxyError))
   })
 
-  const openActivityStream = (sessionId: string, after: number) =>
-    Effect.gen(function*() {
+  const openActivityStream = Effect.fn("AgentProxy.openActivityStream")(
+    function*(sessionId: string, after: number) {
       const request = HttpClientRequest.get(
         url(
           `/v1/sessions/${encodeURIComponent(sessionId)}/activity?after=${after}`
@@ -132,7 +132,8 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
         })
       }
       return response
-    })
+    }
+  )
 
   return Service.of({
     createSession: Effect.fn("AgentProxy.createSession")(

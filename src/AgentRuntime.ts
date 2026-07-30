@@ -9,13 +9,13 @@ const agentContext = (
   headId: string
 ): ReadonlyArray<Agent.ContextEntry> => {
   const context: Array<Agent.ContextEntry> = []
-  for (const entry of Session.branchHistory(history, headId)) {
-    if (entry.type === "LegacyToolCall") {
+  for (const record of Session.branchHistory(history, headId)) {
+    if (record.type === "LegacyToolCall") {
       context.push({
         type: "Tool" as const,
-        commitId: entry.legacyId,
-        name: entry.name,
-        input: entry.input,
+        commitId: record.legacyId,
+        name: record.name,
+        input: record.input,
         outcome: {
           type: "Failure" as const,
           value: "Legacy tool result was not persisted"
@@ -23,30 +23,30 @@ const agentContext = (
       })
       continue
     }
-    if (entry.type === "UserCommit") {
+    if (record.type === "UserCommit") {
       context.push({
         type: "User" as const,
-        commitId: entry.commitId,
-        content: entry.content
+        commitId: record.commitId,
+        content: record.content
       })
       continue
     }
-    if (entry.type === "AgentMessageCommit") {
+    if (record.type === "AgentMessageCommit") {
       context.push({
         type: "AgentMessage" as const,
-        commitId: entry.commitId,
-        content: entry.content
+        commitId: record.commitId,
+        content: record.content
       })
       continue
     }
     context.push({
       type: "Tool" as const,
-      commitId: entry.commitId,
-      name: entry.name,
-      input: entry.input,
-      outcome: entry.outcome.type === "Success"
-        ? { type: "Success" as const, value: entry.outcome.result }
-        : { type: "Failure" as const, value: entry.outcome.failure }
+      commitId: record.commitId,
+      name: record.name,
+      input: record.input,
+      outcome: record.outcome.type === "Success"
+        ? { type: "Success" as const, value: record.outcome.result }
+        : { type: "Failure" as const, value: record.outcome.failure }
     })
   }
   return context
