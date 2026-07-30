@@ -2,10 +2,10 @@ import { BunRuntime, BunServices } from "@effect/platform-bun"
 import { Effect, Option } from "effect"
 import { Argument, Command, Flag } from "effect/unstable/cli"
 import * as AgentProxy from "./AgentProxy.ts"
+import * as DatabaseAdmin from "./DatabaseAdmin.ts"
 import { Harness } from "./Harness.ts"
 import * as Server from "./Server.ts"
 import { defaultServerPort, defaultServerUrl, ensureServer } from "./ServerManager.ts"
-import * as Session from "./Session.ts"
 
 const formatTsvValue = (value: unknown): string => {
   if (value === null || value === undefined) return ""
@@ -15,8 +15,8 @@ const formatTsvValue = (value: unknown): string => {
 
 const runDatabaseQuery = Effect.fn("Cli.runDatabaseQuery")(
   function*(query: string, format: "json" | "tsv") {
-    const session = yield* Session.Service
-    const rows = yield* session.query(query).pipe(Effect.orDie)
+    const database = yield* DatabaseAdmin.Service
+    const rows = yield* database.query(query).pipe(Effect.orDie)
 
     if (format === "json") {
       console.log(JSON.stringify(rows, null, 2))
@@ -46,7 +46,7 @@ const databaseCommand = Command.make(
     )
   },
   ({ query, format }) => runDatabaseQuery(query, format).pipe(
-    Effect.provide(Session.layer())
+    Effect.provide(DatabaseAdmin.layer())
   )
 ).pipe(
   Command.withDescription("Execute SQL against the Corredor database")

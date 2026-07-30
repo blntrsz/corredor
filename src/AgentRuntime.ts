@@ -60,15 +60,26 @@ export const make = Effect.gen(function*() {
   const store = yield* Session.Service
   const agent = yield* Agent.Service
 
-  const react = (item: Session.HistoryItem) => Effect.gen(function*() {
+  const react = Effect.fn("AgentRuntime.react")(function*(
+    item: Session.HistoryItem
+  ) {
     if (item.type !== "UserCommit") return
 
     const snapshot = yield* store.history(item.sessionId)
-    const existingReply = snapshot.items.find((candidate) =>
+    const existingAgentMessage = snapshot.items.find((candidate) =>
       candidate.type === "AgentMessageCommit" &&
       candidate.inReplyTo === item.commitId
     )
-    if (existingReply !== undefined) return
+    if (existingAgentMessage !== undefined) return
+
+    const durableToolCommits = snapshot.items.filter(
+      (candidate): candidate is Extract<
+        Session.Commit,
+        { readonly type: "ToolCommit" }
+      > => candidate.type === "ToolCommit" &&
+        candidate.inReplyTo === item.commitId
+    ).sort((left, right) => left.index - right.index)
+    const runHeadId = durableToolCommits.at(-1)?.commitId ?? item.commitId
 
     const toolCalls = new Map<string, {
       readonly id: string
@@ -76,10 +87,10 @@ export const make = Effect.gen(function*() {
       readonly input: unknown
       readonly index: number
     }>()
-    let nextToolIndex = 0
+    let nextToolIndex = (durableToolCommits.at(-1)?.index ?? -1) + 1
 
     const response = yield* agent.run(
-      agentContext(snapshot.items, item.commitId),
+      agentContext(snapshot.items, runHeadId),
       (agentEvent) => {
         if (agentEvent.type === "ToolCall") {
           toolCalls.set(agentEvent.id, {
@@ -114,7 +125,7 @@ export const make = Effect.gen(function*() {
     )
   })
 
-  const drain = Effect.gen(function*() {
+  const drain = Effect.fn("AgentRuntime.drain")(function*() {
     const checkpoint = yield* store.checkpoint(consumerName)
     const activity = yield* store.activityAfter(checkpoint)
     for (const item of activity) {
@@ -123,7 +134,7 @@ export const make = Effect.gen(function*() {
     }
   })
 
-  yield* drain.pipe(
+  yield* drain().pipe(
     Effect.catchCause(Effect.logError),
     Effect.andThen(Effect.sleep("10 millis")),
     Effect.forever,
@@ -131,5 +142,10 @@ export const make = Effect.gen(function*() {
   )
 })
 
+export const layerWithoutDependencies = Layer.effectDiscard(make)
+
 /** This layer must only be installed in an API/runtime process. */
-export const layer = Layer.effectDiscard(make)
+export const layer = layerWithoutDependencies.pipe(
+  Layer.provide(Agent.layer),
+  Layer.provide(Session.layer())
+)

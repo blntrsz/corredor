@@ -134,68 +134,82 @@ export namespace Agent {
     const languageModel = yield* LanguageModel.LanguageModel
     const toolkit = yield* Tools
     const semaphore = yield* Semaphore.make(1)
-    const run: Interface["run"] = (context, onEvent) => Effect.gen(function*() {
-      const latest = context.at(-1)
-      const prompt = latest?.type === "User" ? latest.content : ""
-      const history = context.slice(0, -1).map((entry) => {
-        if (entry.type === "User") {
-          return { role: "user" as const, content: entry.content }
-        }
-        if (entry.type === "AgentMessage") {
-          return { role: "assistant" as const, content: entry.content }
-        }
-        const outcome = entry.outcome.type === "Success"
-          ? { result: entry.outcome.value }
-          : { failure: entry.outcome.value }
-        return {
-          role: "assistant" as const,
-          content: `[Completed tool ${entry.name}: ${JSON.stringify({
-            input: entry.input,
-            ...outcome
-          })}]`
-        }
-      })
-      const chat = yield* Chat.fromPrompt([
-        { role: "system", content: systemPrompt },
-        ...history
-      ])
+    const run: Interface["run"] = Effect.fn("Agent.run")(
+      function*<E = never, R = never>(
+        context: ReadonlyArray<ContextEntry>,
+        onEvent: (event: Event) => Effect.Effect<void, E, R>
+      ) {
+        const latest = context.at(-1)
+        const resumingAfterTool = latest?.type === "Tool"
+        const prompt = latest?.type === "User"
+          ? latest.content
+          : resumingAfterTool
+          ? "Continue from the durable completed tool interaction. Use another tool only if needed."
+          : ""
+        const historyEntries = latest?.type === "User"
+          ? context.slice(0, -1)
+          : context
+        const history = historyEntries.map((entry) => {
+          if (entry.type === "User") {
+            return { role: "user" as const, content: entry.content }
+          }
+          if (entry.type === "AgentMessage") {
+            return { role: "assistant" as const, content: entry.content }
+          }
+          const outcome = entry.outcome.type === "Success"
+            ? { result: entry.outcome.value }
+            : { failure: entry.outcome.value }
+          return {
+            role: "assistant" as const,
+            content: `[Completed tool ${entry.name}: ${JSON.stringify({
+              input: entry.input,
+              ...outcome
+            })}]`
+          }
+        })
+        const chat = yield* Chat.fromPrompt([
+          { role: "system", content: systemPrompt },
+          ...history
+        ])
 
-      for (let turn = 0; turn < maxTurns; turn++) {
-        const response = yield* chat.generateText({
-          prompt: turn === 0 ? prompt : [],
-          toolkit
-        }).pipe(
-          Effect.provideService(LanguageModel.LanguageModel, languageModel),
-          Effect.catchTag("AiError", (error) =>
-            Effect.fail(new ModelError({ reason: error.reason })))
-        )
+        for (let turn = 0; turn < maxTurns; turn++) {
+          const response = yield* chat.generateText({
+            prompt: turn === 0 ? prompt : [],
+            toolkit
+          }).pipe(
+            Effect.provideService(LanguageModel.LanguageModel, languageModel),
+            Effect.catchTag("AiError", (error) =>
+              Effect.fail(new ModelError({ reason: error.reason })))
+          )
 
-        for (const part of response.content) {
-          if (part.type === "tool-call") {
-            yield* onEvent({
-              type: "ToolCall",
-              id: part.id,
-              name: part.name,
-              input: part.params
-            })
-          } else if (part.type === "tool-result") {
-            yield* onEvent({
-              type: "ToolResult",
-              id: part.id,
-              name: part.name,
-              result: part.result,
-              isFailure: part.isFailure
-            })
+          for (const part of response.content) {
+            if (part.type === "tool-call") {
+              yield* onEvent({
+                type: "ToolCall",
+                id: part.id,
+                name: part.name,
+                input: part.params
+              })
+            } else if (part.type === "tool-result") {
+              yield* onEvent({
+                type: "ToolResult",
+                id: part.id,
+                name: part.name,
+                result: part.result,
+                isFailure: part.isFailure
+              })
+            }
+          }
+
+          if (response.toolCalls.length === 0) {
+            return response.text
           }
         }
 
-        if (response.toolCalls.length === 0) {
-          return response.text
-        }
-      }
-
-      return yield* new TurnLimitExceeded({ maxTurns })
-    }).pipe(semaphore.withPermits(1))
+        return yield* new TurnLimitExceeded({ maxTurns })
+      },
+      (effect) => effect.pipe(semaphore.withPermits(1))
+    )
 
     return Service.of({ run })
   })

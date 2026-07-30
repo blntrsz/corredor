@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, it } from "@effect/vitest"
 import {
   branchHistory,
   commitGraph,
@@ -25,7 +25,7 @@ const commit = (
 } as Commit)
 
 describe("Commit graph", () => {
-  test("preserves canonical single-parent ancestry", () => {
+  it("preserves canonical single-parent ancestry", () => {
     const history = [
       commit(1, {
         type: "UserCommit",
@@ -49,7 +49,7 @@ describe("Commit graph", () => {
     )).toEqual(["u1", "a1"])
   })
 
-  test("preserves divergent Branches without letting a delayed response move the derived head", () => {
+  it("preserves divergent Branches without letting a delayed response move the derived head", () => {
     const history = [
       commit(1, {
         type: "UserCommit",
@@ -81,7 +81,7 @@ describe("Commit graph", () => {
     )).toEqual(["u1", "a1"])
   })
 
-  test("keeps a completed Tool Commit atomic in ancestry", () => {
+  it("keeps a completed Tool Commit atomic in ancestry", () => {
     const history = [
       commit(1, {
         type: "UserCommit",
@@ -108,7 +108,7 @@ describe("Commit graph", () => {
     expect(branchHistory(history)).toEqual(history)
   })
 
-  test("uses legacy navigation only as readable migration input", () => {
+  it("uses legacy navigation only as readable migration input", () => {
     const navigation: LegacyNavigation = {
       type: "LegacyNavigation",
       activityId: "navigation",

@@ -1,8 +1,10 @@
 import { SqliteClient, SqliteMigrator } from "@effect/sql-sqlite-bun"
+import { BunCrypto } from "@effect/platform-bun"
 import { mkdirSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
-import { Context, Effect, Layer, Schema } from "effect"
+import { isDeepStrictEqual } from "node:util"
+import { Clock, Context, Crypto, Effect, Layer, Schema } from "effect"
 import { Reactivity } from "effect/unstable/reactivity"
 import { SqlClient } from "effect/unstable/sql"
 import * as SessionMigrations from "./SessionMigrations.ts"
@@ -26,6 +28,7 @@ export type Commit =
   | CommitMetadata & {
     readonly type: "UserCommit"
     readonly content: string
+    readonly legacyMessageId?: string
   }
   | CommitMetadata & {
     readonly type: "ToolCommit"
@@ -40,6 +43,7 @@ export type Commit =
     readonly type: "AgentMessageCommit"
     readonly content: string
     readonly inReplyTo: string
+    readonly legacyMessageId?: string
   }
 
 export interface LegacyToolCall {
@@ -111,7 +115,8 @@ const ToolOutcomeSchema = Schema.Union([
 const UserCommitSchema = Schema.Struct({
   ...commitMetadata,
   type: Schema.Literal("UserCommit"),
-  content: Schema.String
+  content: Schema.String,
+  legacyMessageId: Schema.optional(Schema.String)
 })
 
 const ToolCommitSchema = Schema.Struct({
@@ -129,7 +134,8 @@ const AgentMessageCommitSchema = Schema.Struct({
   ...commitMetadata,
   type: Schema.Literal("AgentMessageCommit"),
   content: Schema.String,
-  inReplyTo: Schema.String
+  inReplyTo: Schema.String,
+  legacyMessageId: Schema.optional(Schema.String)
 })
 
 export const SessionCreatedSchema = Schema.Struct({
@@ -193,7 +199,20 @@ export class CommitNotFound extends Schema.TaggedErrorClass<CommitNotFound>()(
   "@corredor/Session/CommitNotFound",
   { sessionId: Schema.String, commitId: Schema.String }
 ) {}
-export type Error = PersistenceError | AlreadyExists | NotFound | CommitNotFound
+export class ToolCommitConflict extends Schema.TaggedErrorClass<ToolCommitConflict>()(
+  "@corredor/Session/ToolCommitConflict",
+  {
+    sessionId: Schema.String,
+    inReplyTo: Schema.String,
+    index: Schema.Number
+  }
+) {}
+export type Error =
+  | PersistenceError
+  | AlreadyExists
+  | NotFound
+  | CommitNotFound
+  | ToolCommitConflict
 
 export interface SessionSummary {
   readonly sessionId: string
@@ -325,7 +344,6 @@ export interface Interface {
   readonly activityAfter: (position: number, limit?: number) => Effect.Effect<ReadonlyArray<HistoryItem>, PersistenceError>
   readonly checkpoint: (consumer: string) => Effect.Effect<number, PersistenceError>
   readonly saveCheckpoint: (consumer: string, position: number) => Effect.Effect<void, PersistenceError>
-  readonly query: (sql: string) => Effect.Effect<ReadonlyArray<Record<string, unknown>>, PersistenceError>
 }
 export class Service extends Context.Service<Service, Interface>()("@corredor/Session") {}
 
@@ -403,7 +421,11 @@ const decodeHistory = (rows: ReadonlyArray<EventRow>): ReadonlyArray<HistoryItem
         commitId: row.event_id,
         parentId,
         createdAt,
-        content: String(payload.content ?? "")
+        content: String(payload.content ?? ""),
+        ...(row.event_type === "UserMessageAdded" &&
+          typeof payload.messageId === "string"
+          ? { legacyMessageId: payload.messageId }
+          : {})
       }
       items.push(commit)
       if (parentId === currentHead) heads.set(row.session_id, commit.commitId)
@@ -418,7 +440,11 @@ const decodeHistory = (rows: ReadonlyArray<EventRow>): ReadonlyArray<HistoryItem
         parentId,
         createdAt,
         content: String(payload.content ?? ""),
-        inReplyTo: String(payload.inReplyTo ?? parentId ?? "")
+        inReplyTo: String(payload.inReplyTo ?? parentId ?? ""),
+        ...(row.event_type === "AgentMessageAdded" &&
+          typeof payload.messageId === "string"
+          ? { legacyMessageId: payload.messageId }
+          : {})
       }
       items.push(commit)
       if (parentId === currentHead) heads.set(row.session_id, commit.commitId)
@@ -473,7 +499,9 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     catch: persistenceError
   })
   const sql = yield* SqliteClient.make({ filename: path })
+  const crypto = yield* Crypto.Crypto
   const persist = Effect.mapError(persistenceError)
+  const randomId = crypto.randomUUIDv4.pipe(persist)
   yield* sql`PRAGMA foreign_keys = ON`.pipe(persist)
   yield* SqliteMigrator.run({ loader: SessionMigrations.loader }).pipe(
     Effect.provideService(SqlClient.SqlClient, sql),
@@ -503,7 +531,7 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     payload: Record<string, unknown>,
     sequence: number
   ) => Effect.gen(function*() {
-    const occurredAt = new Date().toISOString()
+    const occurredAt = new Date(yield* Clock.currentTimeMillis).toISOString()
     yield* sql`INSERT INTO session_events (event_id, session_id, sequence, event_type, payload, occurred_at)
       VALUES (${eventId}, ${sessionId}, ${sequence}, ${type}, ${JSON.stringify(payload)}, ${occurredAt})`
     yield* sql`INSERT INTO event_dispatch (event_id) VALUES (${eventId})`
@@ -547,7 +575,13 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       const result = yield* Effect.gen(function*() {
         const rows = yield* sessionRows(sessionId)
         if (rows.length > 0) return { type: "AlreadyExists" as const }
-        const item = yield* insert(sessionId, crypto.randomUUID(), "SessionCreated", {}, 1)
+        const item = yield* insert(
+          sessionId,
+          yield* randomId,
+          "SessionCreated",
+          {},
+          1
+        )
         yield* sql`INSERT INTO session_branch_heads (session_id, commit_id) VALUES (${sessionId}, NULL)`
         return { type: "Created" as const, item: item as SessionCreated }
       }).pipe(sql.withTransaction, persist)
@@ -594,17 +628,27 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         const rows = yield* sessionRows(sessionId)
         if (rows.length === 0) return { type: "NotFound" as const }
         const history = decodeHistory(rows)
-        const existing = history.find((item) =>
-          item.type === "ToolCommit" &&
-          item.inReplyTo === inReplyTo &&
-          item.index === index
+        const existing = history.find(
+          (item): item is Extract<Commit, { readonly type: "ToolCommit" }> =>
+            item.type === "ToolCommit" &&
+            item.inReplyTo === inReplyTo &&
+            item.index === index
         )
-        if (existing !== undefined) return { type: "Appended" as const, item: existing }
+        if (existing !== undefined) {
+          const sameInteraction =
+            existing.toolCallId === toolCallId &&
+            existing.name === name &&
+            isDeepStrictEqual(existing.input, input) &&
+            isDeepStrictEqual(existing.outcome, outcome)
+          return sameInteraction
+            ? { type: "Appended" as const, item: existing }
+            : { type: "ToolCommitConflict" as const }
+        }
         if (!history.some((item) => isGraphEntry(item) && graphEntryId(item) === inReplyTo)) {
           return { type: "CommitNotFound" as const, commitId: inReplyTo }
         }
         const parentId = responseParent(history, inReplyTo)
-        const commitId = crypto.randomUUID()
+        const commitId = yield* randomId
         const item = yield* insert(
           sessionId,
           commitId,
@@ -618,6 +662,9 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       if (result.type === "NotFound") return yield* new NotFound({ sessionId })
       if (result.type === "CommitNotFound") {
         return yield* new CommitNotFound({ sessionId, commitId: result.commitId })
+      }
+      if (result.type === "ToolCommitConflict") {
+        return yield* new ToolCommitConflict({ sessionId, inReplyTo, index })
       }
       return result.item as Extract<Commit, { readonly type: "ToolCommit" }>
     }),
@@ -641,7 +688,7 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
             return { type: "CommitNotFound" as const, commitId: inReplyTo }
           }
           const parentId = responseParent(history, inReplyTo)
-          const commitId = crypto.randomUUID()
+          const commitId = yield* randomId
           const item = yield* insert(
             sessionId,
             commitId,
@@ -741,11 +788,14 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
           ON CONFLICT(consumer) DO UPDATE SET position=excluded.position
         `.pipe(Effect.asVoid, persist)
       }
-    ),
-    query: Effect.fn("Session.query")(function*(query) {
-      return yield* sql.unsafe<Record<string, unknown>>(query).pipe(persist)
-    })
+    )
   })
 }).pipe(Effect.provide(Reactivity.layer))
 
-export const layer = (path = defaultDatabasePath) => Layer.effect(Service, make(path))
+export const layerWithoutDependencies = (path = defaultDatabasePath) =>
+  Layer.effect(Service, make(path))
+
+export const layer = (path = defaultDatabasePath) =>
+  layerWithoutDependencies(path).pipe(
+    Layer.provide(BunCrypto.layer)
+  )

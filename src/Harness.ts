@@ -244,7 +244,18 @@ class TreePicker implements Component, Focusable {
         ? [cyan("You"), item.event.content]
         : item.event.type === "AgentMessageCommit"
         ? [green("Agent"), item.event.content]
-        : [dim(`Tool · ${item.event.name}`), JSON.stringify(item.event.input)]
+        : item.event.type === "ToolCommit"
+        ? [
+          dim(`Tool Commit · ${item.event.name}`),
+          JSON.stringify({
+            input: item.event.input,
+            outcome: item.event.outcome
+          })
+        ]
+        : [
+          dim(`Legacy Tool Record · ${item.event.name}`),
+          JSON.stringify({ input: item.event.input, result: "not persisted" })
+        ]
       const content = (rawContent ?? "").replace(/\s+/g, " ").trim() || "(empty)"
       const line = `  ${cursor} ${marker} ${item.treePrefix}${role}: ${content}`
       lines.push(truncateToWidth(selected ? bold(line) : line, width))
@@ -347,12 +358,34 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
     messages.addChild(new Spacer(1))
   }
 
-  const addToolCall = (name: string, input: unknown) => {
-    const params = input as { readonly command?: unknown }
-    const detail = name === "Bash" && typeof params.command === "string"
+  const addToolEntry = (
+    entry: Extract<Session.GraphEntry, {
+      readonly type: "ToolCommit" | "LegacyToolCall"
+    }>
+  ) => {
+    const params = entry.input as { readonly command?: unknown }
+    const detail = entry.name === "Bash" && typeof params.command === "string"
       ? JSON.stringify(params.command)
-      : JSON.stringify(input)
-    messages.addChild(new Text(bold(dim(`Tool · ${name}(${detail})`)), 1, 0))
+      : JSON.stringify(entry.input)
+    const label = entry.type === "ToolCommit" ? "Tool Commit" : "Legacy Tool Record"
+    messages.addChild(
+      new Text(bold(dim(`${label} · ${entry.name}(${detail})`)), 1, 0)
+    )
+    if (entry.type === "ToolCommit") {
+      const outcome = entry.outcome.type === "Success"
+        ? entry.outcome.result
+        : entry.outcome.failure
+      const outcomeLabel = entry.outcome.type === "Success" ? "Result" : "Failure"
+      messages.addChild(new Text(
+        entry.outcome.type === "Success"
+          ? dim(`${outcomeLabel}: ${JSON.stringify(outcome)}`)
+          : red(`${outcomeLabel}: ${JSON.stringify(outcome)}`),
+        1,
+        1
+      ))
+    } else {
+      messages.addChild(new Text(dim("Result was not persisted."), 1, 1))
+    }
     messages.addChild(new Spacer(1))
   }
 
@@ -367,7 +400,7 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
       else if (entry.type === "AgentMessageCommit") {
         addAssistantMessage(entry.content)
       } else {
-        addToolCall(entry.name, entry.input)
+        addToolEntry(entry)
       }
     }
 

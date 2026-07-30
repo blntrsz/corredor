@@ -17,6 +17,18 @@ Or start the API in the foreground:
 DEEPSEEK_API_KEY=... bun run agent server
 ```
 
+## Test
+
+```bash
+bun run typecheck
+bun run test
+```
+
+The suite uses Vitest with `@effect/vitest`. Effect integration tests return
+their programs directly through `it.live`, so scoped Layers and resources are
+acquired and released by the test runtime. Vitest is launched with Bun because
+the SQLite and HTTP adapters use `bun:` modules.
+
 In the interactive client, use `/history` to browse every Commit and compatible
 legacy tool record in the current Session. Selecting a User Commit restores its
 content to the editor so it can be edited and submitted on a new Branch;

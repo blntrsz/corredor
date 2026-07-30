@@ -1,4 +1,5 @@
-import { Context, Effect, Layer } from "effect"
+import { BunCrypto } from "@effect/platform-bun"
+import { Context, Crypto, Effect, Layer } from "effect"
 import * as Session from "./Session.ts"
 
 /**
@@ -40,11 +41,17 @@ export class Service extends Context.Service<Service, Interface>()(
 
 export const make = Effect.gen(function*() {
   const store = yield* Session.Service
+  const crypto = yield* Crypto.Crypto
+  const randomId = crypto.randomUUIDv4.pipe(
+    Effect.mapError((cause) => new Session.PersistenceError({
+      message: cause.message
+    }))
+  )
 
   return Service.of({
     createSession: Effect.fn("Application.createSession")(
       function*(requestedId?: string) {
-        return yield* store.createSession(requestedId ?? crypto.randomUUID())
+        return yield* store.createSession(requestedId ?? (yield* randomId))
       }
     ),
     submitUserCommit: Effect.fn("Application.submitUserCommit")(
@@ -52,7 +59,7 @@ export const make = Effect.gen(function*() {
         return yield* store.appendUserCommit(
           sessionId,
           content,
-          requestedId ?? crypto.randomUUID()
+          requestedId ?? (yield* randomId)
         )
       }
     ),
@@ -75,4 +82,9 @@ export const make = Effect.gen(function*() {
   })
 })
 
-export const layer = Layer.effect(Service, make)
+export const layerWithoutDependencies = Layer.effect(Service, make)
+
+export const layer = layerWithoutDependencies.pipe(
+  Layer.provide(Session.layer()),
+  Layer.provide(BunCrypto.layer)
+)

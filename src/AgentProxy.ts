@@ -135,31 +135,35 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
     })
 
   return Service.of({
-    createSession: (sessionId) => Effect.gen(function*() {
-      const body = yield* responseJson(
-        HttpClientRequest.post(url("/v1/sessions")).pipe(
-          HttpClientRequest.bodyJsonUnsafe(
-            sessionId === undefined ? {} : { sessionId }
+    createSession: Effect.fn("AgentProxy.createSession")(
+      function*(sessionId?: string) {
+        const body = yield* responseJson(
+          HttpClientRequest.post(url("/v1/sessions")).pipe(
+            HttpClientRequest.bodyJsonUnsafe(
+              sessionId === undefined ? {} : { sessionId }
+            )
           )
         )
-      )
-      const decoded = yield* Schema.decodeUnknownEffect(CreateSessionResponse)(
-        body
-      ).pipe(Effect.mapError(proxyError))
-      return decoded.session as Session.SessionCreated
-    }),
-    submitUserCommit: (sessionId, content, commitId) => Effect.gen(function*() {
-      const body = yield* responseJson(HttpClientRequest.post(
-        url(`/v1/sessions/${encodeURIComponent(sessionId)}/commits`)
-      ).pipe(HttpClientRequest.bodyJsonUnsafe({ commitId, content })))
-      const decoded = yield* Schema.decodeUnknownEffect(CommitResponse)(body)
-        .pipe(Effect.mapError(proxyError))
-      return decoded.commit as Extract<
-        Session.Commit,
-        { readonly type: "UserCommit" }
-      >
-    }),
-    listSessions: () => Effect.gen(function*() {
+        const decoded = yield* Schema.decodeUnknownEffect(
+          CreateSessionResponse
+        )(body).pipe(Effect.mapError(proxyError))
+        return decoded.session as Session.SessionCreated
+      }
+    ),
+    submitUserCommit: Effect.fn("AgentProxy.submitUserCommit")(
+      function*(sessionId: string, content: string, commitId: string) {
+        const body = yield* responseJson(HttpClientRequest.post(
+          url(`/v1/sessions/${encodeURIComponent(sessionId)}/commits`)
+        ).pipe(HttpClientRequest.bodyJsonUnsafe({ commitId, content })))
+        const decoded = yield* Schema.decodeUnknownEffect(CommitResponse)(body)
+          .pipe(Effect.mapError(proxyError))
+        return decoded.commit as Extract<
+          Session.Commit,
+          { readonly type: "UserCommit" }
+        >
+      }
+    ),
+    listSessions: Effect.fn("AgentProxy.listSessions")(function*() {
       const body = yield* responseJson(
         HttpClientRequest.get(url("/v1/sessions"))
       )
@@ -167,7 +171,7 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
         .pipe(Effect.mapError(proxyError))
       return decoded.sessions as ReadonlyArray<Session.SessionSummary>
     }),
-    history: (sessionId) => Effect.gen(function*() {
+    history: Effect.fn("AgentProxy.history")(function*(sessionId: string) {
       const body = yield* responseJson(HttpClientRequest.get(
         url(`/v1/sessions/${encodeURIComponent(sessionId)}/history`)
       ))
@@ -175,7 +179,10 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
         .pipe(Effect.mapError(proxyError))
       return decoded.history as Session.HistorySnapshot
     }),
-    checkout: (sessionId, commitId) => Effect.gen(function*() {
+    checkout: Effect.fn("AgentProxy.checkout")(function*(
+      sessionId: string,
+      commitId: string | null
+    ) {
       const response = yield* execute(HttpClientRequest.post(
         url(`/v1/sessions/${encodeURIComponent(sessionId)}/head`)
       ).pipe(HttpClientRequest.bodyJsonUnsafe({ commitId })))

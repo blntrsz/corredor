@@ -1,13 +1,11 @@
-import { expect, test } from "bun:test"
-import { mkdtempSync, rmSync } from "node:fs"
+import { expect, it } from "@effect/vitest"
 import { createServer } from "node:net"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
 import { Effect, Fiber, Layer, Stream } from "effect"
 import { Agent } from "./Agent.ts"
 import * as AgentProxy from "./AgentProxy.ts"
 import * as Server from "./Server.ts"
 import * as Session from "./Session.ts"
+import { temporaryDatabase } from "./TestSupport.ts"
 
 const availablePort = async (): Promise<number> => {
   const server = createServer()
@@ -25,41 +23,41 @@ const availablePort = async (): Promise<number> => {
   return address.port
 }
 
-test("history and reconnectable activity expose canonical Commits to the client", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "corredor-http-"))
-  const path = join(directory, "corredor.db")
-  const port = await availablePort()
-  const baseUrl = `http://127.0.0.1:${port}`
+it.live(
+  "history and reconnectable activity expose canonical Commits to the client",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-http-")
+    const port = yield* Effect.promise(availablePort)
+    const baseUrl = `http://127.0.0.1:${port}`
 
-  const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
-    run: (_context, onEvent) => Effect.gen(function*() {
-      yield* onEvent({
-        type: "ToolCall",
-        id: "call-http",
-        name: "Lookup",
-        input: { subject: "Commits" }
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (_context, onEvent) => Effect.gen(function*() {
+        yield* onEvent({
+          type: "ToolCall",
+          id: "call-http",
+          name: "Lookup",
+          input: { subject: "Commits" }
+        })
+        yield* onEvent({
+          type: "ToolResult",
+          id: "call-http",
+          name: "Lookup",
+          result: { durable: true },
+          isFailure: false
+        })
+        return "Commits are durable."
       })
-      yield* onEvent({
-        type: "ToolResult",
-        id: "call-http",
-        name: "Lookup",
-        result: { durable: true },
-        isFailure: false
-      })
-      return "Commits are durable."
-    })
-  }))
+    }))
 
-  const layer = Layer.mergeAll(
-    Server.layerWithoutDependencies({ host: "127.0.0.1", port }),
-    AgentProxy.layer({ baseUrl })
-  ).pipe(
-    Layer.provide(Session.layer(path)),
-    Layer.provide(fakeAgent)
-  )
+    const layer = Layer.mergeAll(
+      Server.layerWithoutDependencies({ host: "127.0.0.1", port }),
+      AgentProxy.layer({ baseUrl })
+    ).pipe(
+      Layer.provide(Session.layer(path)),
+      Layer.provide(fakeAgent)
+    )
 
-  try {
-    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function*() {
+    const result = yield* Effect.gen(function*() {
       const proxy = yield* AgentProxy.Service
       const session = yield* proxy.createSession("http-session")
 
@@ -83,7 +81,7 @@ test("history and reconnectable activity expose canonical Commits to the client"
       const checkedOut = yield* proxy.history(session.sessionId)
       const sessions = yield* proxy.listSessions()
       return { user, activity, history, checkedOut, sessions }
-    }).pipe(Effect.provide(layer))))
+    }).pipe(Effect.provide(layer))
 
     expect(result.user).toMatchObject({
       type: "UserCommit",
@@ -110,7 +108,5 @@ test("history and reconnectable activity expose canonical Commits to the client"
         userCommitCount: 1
       })
     ])
-  } finally {
-    rmSync(directory, { recursive: true, force: true })
-  }
-})
+  })
+)

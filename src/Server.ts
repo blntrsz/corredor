@@ -1,4 +1,4 @@
-import { BunHttpServer } from "@effect/platform-bun"
+import { BunCrypto, BunHttpServer } from "@effect/platform-bun"
 import { Effect, Layer, Option, Schema, Stream } from "effect"
 import {
   HttpRouter,
@@ -215,9 +215,10 @@ export interface Options {
 export const layerWithoutDependencies = ({ host, port }: Options) =>
   Layer.mergeAll(
     HttpRouter.serve(routes),
-    AgentRuntime.layer
+    AgentRuntime.layerWithoutDependencies
   ).pipe(
-    Layer.provide(Application.layer),
+    Layer.provide(Application.layerWithoutDependencies),
+    Layer.provide(BunCrypto.layer),
     Layer.provide(BunHttpServer.layer({ hostname: host, port }))
   )
 
