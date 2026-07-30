@@ -20,7 +20,7 @@ const isHealthy = async (baseUrl: string): Promise<boolean> => {
     })
     if (!response.ok) return false
     const body = await response.json() as Record<string, unknown>
-    return body.status === "ok" && body.service === "corredor" && body.apiVersion === 2
+    return body.status === "ok" && body.service === "corredor" && body.apiVersion === 3
   } catch {
     return false
   }

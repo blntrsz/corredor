@@ -11,27 +11,43 @@ const consumerName = "agent-runtime-v1"
 const make = Effect.gen(function*() {
   const store = yield* Session.Service
   const agents = yield* Agent.Service
-  const runners = new Map<string, Agent.Runner>()
+  interface RunnerState {
+    readonly runner: Agent.Runner
+    leafId: string | null
+  }
+  const runners = new Map<string, RunnerState>()
 
-  const runnerFor = (sessionId: string, beforeSequence: number) => Effect.gen(function*() {
-    const existing = runners.get(sessionId)
-    if (existing !== undefined) return existing
+  const runnerFor = (event: Extract<Session.StoredEvent, { readonly type: "UserMessageAdded" }>) => Effect.gen(function*() {
+    const events = yield* store.events(event.sessionId)
+    const parentId = Session.conversationParentId(events, event.eventId) ?? null
+    const existing = runners.get(event.sessionId)
+    if (existing !== undefined && existing.leafId === parentId) return existing
 
     const history: Array<{ role: "user" | "assistant"; content: string }> = []
-    for (const event of (yield* store.events(sessionId))) {
-      if (event.sequence >= beforeSequence) continue
-      if (event.type === "UserMessageAdded") history.push({ role: "user", content: event.payload.content })
-      if (event.type === "AgentMessageAdded") history.push({ role: "assistant", content: event.payload.content })
+    for (const ancestor of Session.conversationBranch(events, event.eventId)) {
+      if (ancestor.eventId === event.eventId) continue
+      if (ancestor.type === "UserMessageAdded") history.push({ role: "user", content: ancestor.payload.content })
+      if (ancestor.type === "AgentMessageAdded") history.push({ role: "assistant", content: ancestor.payload.content })
     }
 
-    const runner = yield* agents.create(history)
-    runners.set(sessionId, runner)
-    return runner
+    const state: RunnerState = {
+      runner: yield* agents.create(history),
+      leafId: parentId
+    }
+    runners.set(event.sessionId, state)
+    return state
   })
 
   const react = (event: Session.StoredEvent) => Effect.gen(function*() {
     if (event.type === "SessionCreated") {
-      yield* runnerFor(event.sessionId, event.sequence + 1)
+      runners.set(event.sessionId, {
+        runner: yield* agents.create(),
+        leafId: null
+      })
+      return
+    }
+    if (event.type === "SessionTreeNavigated") {
+      runners.delete(event.sessionId)
       return
     }
     if (event.type !== "UserMessageAdded") return
@@ -41,11 +57,14 @@ const make = Effect.gen(function*() {
     const existingReply = (yield* store.events(event.sessionId)).find(
       (candidate) => candidate.type === "AgentMessageAdded" && candidate.payload.inReplyTo === event.eventId
     )
-    if (existingReply !== undefined) return
+    if (existingReply !== undefined) {
+      runners.delete(event.sessionId)
+      return
+    }
 
-    const runner = yield* runnerFor(event.sessionId, event.sequence)
+    const state = yield* runnerFor(event)
     let toolCallIndex = 0
-    const response = yield* runner.run(event.payload.content, (agentEvent) => {
+    const response = yield* state.runner.run(event.payload.content, (agentEvent) => {
       if (agentEvent.type !== "ToolCall") return Effect.void
       const index = toolCallIndex++
       return Effect.gen(function*() {
@@ -65,7 +84,8 @@ const make = Effect.gen(function*() {
         )
       })
     })
-    yield* store.appendAgentMessage(event.sessionId, crypto.randomUUID(), response, event.eventId)
+    const reply = yield* store.appendAgentMessage(event.sessionId, crypto.randomUUID(), response, event.eventId)
+    if (runners.get(event.sessionId) === state) state.leafId = reply.eventId
   })
 
   const drain = Effect.gen(function*() {

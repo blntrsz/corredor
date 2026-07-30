@@ -17,6 +17,12 @@ Or start the API in the foreground:
 DEEPSEEK_API_KEY=... bun run agent server
 ```
 
+In the interactive client, use `/tree` to browse every user message, agent reply,
+and tool call in the current session. Selecting a user message restores it to the
+editor so it can be edited and resubmitted as a new branch; selecting an agent
+reply or tool call continues from that point. Previous branches remain available
+in the same session.
+
 ```bash
 # Create a session (body may also contain a chosen sessionId)
 curl -X POST http://127.0.0.1:5050/v1/sessions \
@@ -32,6 +38,10 @@ curl -N http://127.0.0.1:5050/v1/sessions/$SESSION_ID/events
 
 # Or retrieve a finite JSON snapshot.
 curl http://127.0.0.1:5050/v1/sessions/$SESSION_ID/history
+
+# Move the active leaf to an event (use null to move before the first message).
+curl -X POST http://127.0.0.1:5050/v1/sessions/$SESSION_ID/tree \
+  -H 'content-type: application/json' -d '{"targetId":"EVENT_ID"}'
 ```
 
 ## Event flow

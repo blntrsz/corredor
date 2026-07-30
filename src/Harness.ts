@@ -18,6 +18,7 @@ import {
 } from "@earendil-works/pi-tui"
 import { Effect, Stream } from "effect"
 import * as AgentProxy from "./AgentProxy.ts"
+import * as Session from "./Session.ts"
 import type { SessionSummary, StoredEvent } from "./Session.ts"
 
 const ansi = (open: string, close: string) =>
@@ -132,6 +133,132 @@ class SessionPicker implements Component, Focusable {
   invalidate(): void {}
 }
 
+type TreeEntryEvent = Session.ConversationEvent
+
+interface TreeEntryItem {
+  readonly event: TreeEntryEvent
+  readonly parentId: string | null
+  /** Tree guides are added only where a parent has multiple children. */
+  readonly treePrefix: string
+  readonly active: boolean
+  readonly current: boolean
+}
+
+class TreePicker implements Component, Focusable {
+  focused = false
+  private selected = 0
+  private readonly items: ReadonlyArray<TreeEntryItem>
+
+  constructor(
+    events: ReadonlyArray<StoredEvent>,
+    private readonly onSelect: (item: TreeEntryItem) => void,
+    private readonly onCancel: () => void,
+    private readonly requestRender: () => void
+  ) {
+    const tree = Session.conversationTree(events)
+    const byId = new Map(tree.nodes.map((node) => [node.event.eventId, node] as const))
+    const activeIds = new Set<string>()
+    let activeId = tree.leafId
+    while (activeId !== null && !activeIds.has(activeId)) {
+      activeIds.add(activeId)
+      activeId = byId.get(activeId)?.parentId ?? null
+    }
+
+    const children = new Map<string | null, Array<Session.ConversationNode>>()
+    for (const node of tree.nodes) {
+      const siblings = children.get(node.parentId) ?? []
+      siblings.push(node)
+      children.set(node.parentId, siblings)
+    }
+
+    const items: Array<TreeEntryItem> = []
+    const visit = (parentId: string | null, ancestorGutters: ReadonlyArray<boolean>) => {
+      const nodes = children.get(parentId) ?? []
+      const branchesHere = nodes.length > 1
+      for (const [index, node] of nodes.entries()) {
+        const isLastBranch = index === nodes.length - 1
+        const ancestorPrefix = ancestorGutters
+          .map((hasLaterSibling) => hasLaterSibling ? "│  " : "   ")
+          .join("")
+        items.push({
+          event: node.event,
+          parentId: node.parentId,
+          treePrefix: branchesHere
+            ? `${ancestorPrefix}${isLastBranch ? "└─ " : "├─ "}`
+            : ancestorPrefix,
+          active: activeIds.has(node.event.eventId),
+          current: node.event.eventId === tree.leafId
+        })
+        visit(
+          node.event.eventId,
+          branchesHere
+            ? [...ancestorGutters, !isLastBranch]
+            : ancestorGutters
+        )
+      }
+    }
+    visit(null, [])
+    this.items = items
+
+    const currentIndex = items.findIndex((item) => item.current)
+    this.selected = currentIndex >= 0
+      ? currentIndex
+      : Math.max(0, items.findLastIndex((item) => item.active))
+  }
+
+  handleInput(data: string): void {
+    if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) return this.onCancel()
+    if (matchesKey(data, Key.up)) this.selected = Math.max(0, this.selected - 1)
+    else if (matchesKey(data, Key.down)) this.selected = Math.min(this.items.length - 1, this.selected + 1)
+    else if (matchesKey(data, Key.left)) this.selected = Math.max(0, this.selected - 10)
+    else if (matchesKey(data, Key.right)) this.selected = Math.min(this.items.length - 1, this.selected + 10)
+    else if (matchesKey(data, Key.enter)) {
+      const item = this.items[this.selected]
+      if (item !== undefined) this.onSelect(item)
+      return
+    }
+    this.requestRender()
+  }
+
+  render(width: number): string[] {
+    const start = Math.max(0, Math.min(
+      this.selected - 8,
+      Math.max(0, this.items.length - 17)
+    ))
+    const lines = [
+      "",
+      bold(cyan("  Conversation Tree")),
+      dim(`  ${this.items.length} messages and tool calls · ● active branch`),
+      ""
+    ]
+
+    for (const [offset, item] of this.items.slice(start, start + 17).entries()) {
+      const index = start + offset
+      const selected = index === this.selected
+      const cursor = selected ? cyan("›") : " "
+      const marker = item.current ? green("◆") : item.active ? cyan("●") : dim("○")
+      const [role, rawContent] = item.event.type === "UserMessageAdded"
+        ? [cyan("You"), item.event.payload.content]
+        : item.event.type === "AgentMessageAdded"
+        ? [green("Agent"), item.event.payload.content]
+        : [dim(`Tool · ${item.event.payload.name}`), JSON.stringify(item.event.payload.input)]
+      const content = (rawContent ?? "").replace(/\s+/g, " ").trim() || "(empty)"
+      const line = `  ${cursor} ${marker} ${item.treePrefix}${role}: ${content}`
+      lines.push(truncateToWidth(selected ? bold(line) : line, width))
+    }
+
+    lines.push(
+      "",
+      dim("  ↑↓ navigate · ←→ page · enter jump · esc cancel"),
+      dim("  Your messages are restored for editing; agent replies and tool calls continue after that point."),
+      ""
+    )
+    return lines.map((line) => truncateToWidth(line, width))
+  }
+
+  invalidate(): void {}
+}
+
 interface Handle {
   readonly done: Promise<void>
   readonly stop: () => void
@@ -156,9 +283,9 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
   let activeController: AbortController | undefined
   let streamController: AbortController | undefined
   let activeLoader: Loader | undefined
-  let pending: { readonly messageId: string; inReplyTo?: string } | undefined
-  const renderedEventIds = new Set<string>()
-  const optimisticMessageIds = new Set<string>()
+  let pending: { readonly messageId: string; readonly content: string; inReplyTo?: string } | undefined
+  const knownEvents = new Map<string, StoredEvent>()
+  const errors: Array<string> = []
 
   const header = new Text(
     `${bold(cyan("Corredor"))}\n${dim("DeepSeek V4 Pro · type / for commands · Ctrl+C to quit")}`,
@@ -182,18 +309,6 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
     resolveDone = resolve
   })
 
-  const finish = () => {
-    if (activeLoader !== undefined) {
-      activeLoader.stop()
-      messages.removeChild(activeLoader)
-      activeLoader = undefined
-    }
-    activeController = undefined
-    editor.disableSubmit = false
-    tui.setFocus(editor)
-    tui.requestRender()
-  }
-
   const stop = () => {
     if (stopped) return
     stopped = true
@@ -207,6 +322,7 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
   editor.setAutocompleteProvider(new CombinedAutocompleteProvider([
     { name: "new", description: "Start a new conversation" },
     { name: "resume", description: "Resume a previous session" },
+    { name: "tree", description: "Jump to an earlier message and branch" },
     { name: "exit", description: "Exit Corredor" }
   ], process.cwd()))
   editor.setAutocompleteMaxVisible(6)
@@ -232,43 +348,81 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
     messages.addChild(new Spacer(1))
   }
 
+  const orderedEvents = (): ReadonlyArray<StoredEvent> =>
+    [...knownEvents.values()].sort((a, b) => a.sequence - b.sequence)
+
+  const renderMessages = () => {
+    messages.clear()
+    const events = orderedEvents()
+    for (const event of Session.conversationBranch(events)) {
+      if (event.type === "UserMessageAdded") addUserMessage(event.payload.content)
+      else if (event.type === "AgentToolCallAdded") addToolCall(event.payload.name, event.payload.input)
+      else addAssistantMessage(event.payload.content)
+    }
+
+    const pendingIsCommitted = pending !== undefined && events.some(
+      (event) => event.type === "UserMessageAdded" && event.payload.messageId === pending?.messageId
+    )
+    if (pending !== undefined && !pendingIsCommitted) addUserMessage(pending.content)
+
+    for (const message of errors) {
+      messages.addChild(new Text(bold(red("Error")), 1, 0))
+      messages.addChild(new Text(message, 1, 1))
+      messages.addChild(new Spacer(1))
+    }
+    if (activeLoader !== undefined) messages.addChild(activeLoader)
+    tui.requestRender()
+  }
+
   const addErrorMessage = (message: string) => {
-    messages.addChild(new Text(bold(red("Error")), 1, 0))
-    messages.addChild(new Text(message, 1, 1))
-    messages.addChild(new Spacer(1))
+    errors.push(message)
+    renderMessages()
+  }
+
+  const finish = () => {
+    if (activeLoader !== undefined) {
+      activeLoader.stop()
+      activeLoader = undefined
+    }
+    activeController = undefined
+    editor.disableSubmit = false
+    renderMessages()
+    tui.setFocus(editor)
+    tui.requestRender()
   }
 
   const renderEvent = (event: StoredEvent) => {
-    if (renderedEventIds.has(event.eventId)) return
-    renderedEventIds.add(event.eventId)
+    if (knownEvents.has(event.eventId)) return
+    knownEvents.set(event.eventId, event)
 
-    if (event.type === "UserMessageAdded") {
-      if (!optimisticMessageIds.delete(event.payload.messageId)) {
-        addUserMessage(event.payload.content)
-      }
-      if (pending?.messageId === event.payload.messageId) pending.inReplyTo = event.eventId
-    } else if (event.type === "AgentToolCallAdded") {
-      addToolCall(event.payload.name, event.payload.input)
-    } else if (event.type === "AgentMessageAdded") {
-      addAssistantMessage(event.payload.content)
-      if (pending?.inReplyTo === event.payload.inReplyTo) {
-        pending = undefined
-        finish()
-      }
+    if (event.type === "UserMessageAdded" && pending?.messageId === event.payload.messageId) {
+      pending.inReplyTo = event.eventId
+    } else if (event.type === "AgentMessageAdded" && pending?.inReplyTo === event.payload.inReplyTo) {
+      pending = undefined
+      finish()
+      return
     }
-    tui.requestRender()
+    renderMessages()
   }
 
   const startEventStream = (id: string) => {
     streamController?.abort()
     const controller = new AbortController()
     streamController = controller
-    const consume = proxy.streamEvents(id).pipe(
-      Stream.runForEach((event) => Effect.sync(() => {
-        if (sessionId === id && !stopped) renderEvent(event)
-      }))
-    )
-    void Effect.runPromise(consume, { signal: controller.signal }).catch((error: unknown) => {
+
+    void Effect.runPromise(proxy.history(id), { signal: controller.signal }).then((history) => {
+      if (stopped || controller.signal.aborted || streamController !== controller || sessionId !== id) return
+      for (const event of history) knownEvents.set(event.eventId, event)
+      renderMessages()
+
+      const after = history.reduce((position, event) => Math.max(position, event.position), 0)
+      const consume = proxy.streamEvents(id, after).pipe(
+        Stream.runForEach((event) => Effect.sync(() => {
+          if (sessionId === id && !stopped) renderEvent(event)
+        }))
+      )
+      return Effect.runPromise(consume, { signal: controller.signal })
+    }).catch((error: unknown) => {
       if (stopped || controller.signal.aborted || streamController !== controller) return
       addErrorMessage(`Event stream failed: ${formatError(error)}`)
       tui.requestRender()
@@ -280,10 +434,10 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
     pending = undefined
     finish()
     sessionId = id
-    messages.clear()
-    renderedEventIds.clear()
-    optimisticMessageIds.clear()
+    knownEvents.clear()
+    errors.length = 0
     editor.setText("")
+    renderMessages()
     showConversation()
     startEventStream(id)
   }
@@ -321,6 +475,51 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
     })
   }
 
+  const openTree = () => {
+    const treeSessionId = sessionId
+    void Effect.runPromise(proxy.history(treeSessionId)).then((history) => {
+      if (stopped || sessionId !== treeSessionId) return
+      for (const event of history) knownEvents.set(event.eventId, event)
+      const hasEntries = Session.conversationTree(history).nodes.length > 0
+      if (!hasEntries) {
+        addErrorMessage("There are no messages to navigate yet.")
+        return
+      }
+
+      let navigating = false
+      const picker = new TreePicker(
+        history,
+        (item) => {
+          if (navigating) return
+          navigating = true
+          const targetId = item.event.type === "UserMessageAdded"
+            ? item.parentId
+            : item.event.eventId
+          void Effect.runPromise(proxy.navigateTree(treeSessionId, targetId)).then((event) => {
+            if (stopped || sessionId !== treeSessionId) return
+            knownEvents.set(event.eventId, event)
+            editor.setText(item.event.type === "UserMessageAdded" ? item.event.payload.content : "")
+            renderMessages()
+            showConversation()
+          }).catch((error: unknown) => {
+            if (stopped || sessionId !== treeSessionId) return
+            showConversation()
+            addErrorMessage(formatError(error))
+          })
+        },
+        showConversation,
+        () => tui.requestRender()
+      )
+      app.clear()
+      app.addChild(picker)
+      tui.setFocus(picker)
+      tui.requestRender()
+    }).catch((error: unknown) => {
+      if (stopped || sessionId !== treeSessionId) return
+      addErrorMessage(formatError(error))
+    })
+  }
+
   const submit = (input: string) => {
     const prompt = input.trim()
     if (prompt.length === 0 || editor.disableSubmit || stopped) return
@@ -328,18 +527,17 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
     if (prompt === "/exit") return stop()
     if (prompt === "/new") return startNewSession()
     if (prompt === "/resume") return resumeSession()
+    if (prompt === "/tree") return openTree()
 
     const messageId = crypto.randomUUID()
-    pending = { messageId }
-    optimisticMessageIds.add(messageId)
+    pending = { messageId, content: prompt }
     editor.addToHistory(prompt)
     editor.disableSubmit = true
-    addUserMessage(prompt)
 
     const loader = new Loader(tui, cyan, dim, "Thinking...")
     activeLoader = loader
-    messages.addChild(loader)
     loader.start()
+    renderMessages()
 
     const controller = new AbortController()
     activeController = controller

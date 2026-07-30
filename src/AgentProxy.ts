@@ -19,6 +19,11 @@ export interface Interface {
     content: string
   ) => Effect.Effect<Session.StoredEvent, ProxyError>
   readonly listSessions: () => Effect.Effect<ReadonlyArray<Session.SessionSummary>, ProxyError>
+  readonly history: (sessionId: string) => Effect.Effect<ReadonlyArray<Session.StoredEvent>, ProxyError>
+  readonly navigateTree: (
+    sessionId: string,
+    targetId: string | null
+  ) => Effect.Effect<Session.StoredEvent, ProxyError>
   readonly streamEvents: (
     sessionId: string,
     after?: number
@@ -33,6 +38,7 @@ const CreateSessionResponse = Schema.Struct({
 })
 const EventResponse = Schema.Struct({ event: Session.StoredEventSchema })
 const SessionsResponse = Schema.Struct({ sessions: Schema.Array(Session.SessionSummarySchema) })
+const HistoryResponse = Schema.Struct({ events: Schema.Array(Session.StoredEventSchema) })
 
 const proxyError = (cause: unknown): ProxyError => new ProxyError({
   message: cause instanceof Error ? cause.message : String(cause)
@@ -116,6 +122,20 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
       const body = yield* responseJson(HttpClientRequest.get(url("/v1/sessions")))
       const decoded = yield* Schema.decodeUnknownEffect(SessionsResponse)(body).pipe(Effect.mapError(proxyError))
       return decoded.sessions as ReadonlyArray<Session.SessionSummary>
+    }),
+    history: (sessionId) => Effect.gen(function*() {
+      const body = yield* responseJson(HttpClientRequest.get(
+        url(`/v1/sessions/${encodeURIComponent(sessionId)}/history`)
+      ))
+      const decoded = yield* Schema.decodeUnknownEffect(HistoryResponse)(body).pipe(Effect.mapError(proxyError))
+      return decoded.events as ReadonlyArray<Session.StoredEvent>
+    }),
+    navigateTree: (sessionId, targetId) => Effect.gen(function*() {
+      const body = yield* responseJson(HttpClientRequest.post(
+        url(`/v1/sessions/${encodeURIComponent(sessionId)}/tree`)
+      ).pipe(HttpClientRequest.bodyJsonUnsafe({ targetId })))
+      const decoded = yield* Schema.decodeUnknownEffect(EventResponse)(body).pipe(Effect.mapError(proxyError))
+      return decoded.event as Session.StoredEvent
     }),
     streamEvents: (sessionId, after = 0) => {
       let cursor = after

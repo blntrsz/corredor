@@ -14,13 +14,13 @@ const health = Session.Service.pipe(
   Effect.flatMap((store) => store.check),
   Effect.match({
     onFailure: () => HttpServerResponse.jsonUnsafe(
-      { status: "unavailable", service: "corredor", apiVersion: 2 },
+      { status: "unavailable", service: "corredor", apiVersion: 3 },
       { status: 503 }
     ),
     onSuccess: () => HttpServerResponse.jsonUnsafe({
       status: "ok",
       service: "corredor",
-      apiVersion: 2
+      apiVersion: 3
     })
   })
 )
@@ -68,6 +68,21 @@ const sessionHistory = Effect.gen(function*() {
     return HttpServerResponse.jsonUnsafe({ error: "missing session id" }, { status: 400 })
   }
   return HttpServerResponse.jsonUnsafe({ events: yield* commands.events(sessionId) })
+}).pipe(Effect.orDie)
+
+const navigateTree = Effect.gen(function*() {
+  const commands = yield* SessionCommands.Service
+  const params = yield* HttpRouter.params
+  const request = yield* HttpServerRequest.HttpServerRequest
+  const sessionId = params.sessionId
+  if (sessionId === undefined) {
+    return HttpServerResponse.jsonUnsafe({ error: "missing session id" }, { status: 400 })
+  }
+  const body = yield* Schema.decodeUnknownEffect(Schema.Struct({
+    targetId: Schema.NullOr(Schema.String)
+  }))(yield* request.json)
+  const event = yield* commands.navigateTree(sessionId, body.targetId)
+  return HttpServerResponse.jsonUnsafe({ event })
 }).pipe(Effect.orDie)
 
 const encoder = new TextEncoder()
@@ -134,6 +149,7 @@ const routes = Layer.mergeAll(
   HttpRouter.add("POST", "/v1/sessions", createSession),
   HttpRouter.add("POST", "/v1/sessions/:sessionId/messages", submitMessage),
   HttpRouter.add("GET", "/v1/sessions/:sessionId/history", sessionHistory),
+  HttpRouter.add("POST", "/v1/sessions/:sessionId/tree", navigateTree),
   HttpRouter.add("GET", "/v1/sessions/:sessionId/events", sessionEvents)
 )
 
