@@ -12,33 +12,48 @@ export class ProxyError extends Schema.TaggedErrorClass<ProxyError>()(
 ) {}
 
 export interface Interface {
-  readonly createSession: (sessionId?: string) => Effect.Effect<Session.StoredEvent, ProxyError>
-  readonly sendMessage: (
+  readonly createSession: (
+    sessionId?: string
+  ) => Effect.Effect<Session.SessionCreated, ProxyError>
+  readonly submitUserCommit: (
     sessionId: string,
-    messageId: string,
-    content: string
-  ) => Effect.Effect<Session.StoredEvent, ProxyError>
-  readonly listSessions: () => Effect.Effect<ReadonlyArray<Session.SessionSummary>, ProxyError>
-  readonly history: (sessionId: string) => Effect.Effect<ReadonlyArray<Session.StoredEvent>, ProxyError>
-  readonly navigateTree: (
+    content: string,
+    commitId: string
+  ) => Effect.Effect<
+    Extract<Session.Commit, { readonly type: "UserCommit" }>,
+    ProxyError
+  >
+  readonly listSessions: () => Effect.Effect<
+    ReadonlyArray<Session.SessionSummary>,
+    ProxyError
+  >
+  readonly history: (
+    sessionId: string
+  ) => Effect.Effect<Session.HistorySnapshot, ProxyError>
+  readonly checkout: (
     sessionId: string,
-    targetId: string | null
-  ) => Effect.Effect<Session.StoredEvent, ProxyError>
-  readonly streamEvents: (
+    commitId: string | null
+  ) => Effect.Effect<void, ProxyError>
+  readonly streamActivity: (
     sessionId: string,
     after?: number
-  ) => Stream.Stream<Session.StoredEvent, ProxyError>
+  ) => Stream.Stream<Session.HistoryItem, ProxyError>
 }
 
-export class Service extends Context.Service<Service, Interface>()("@corredor/AgentProxy") {}
+export class Service extends Context.Service<Service, Interface>()(
+  "@corredor/AgentProxy"
+) {}
 
 const CreateSessionResponse = Schema.Struct({
-  sessionId: Schema.String,
-  event: Session.StoredEventSchema
+  session: Session.SessionCreatedSchema
 })
-const EventResponse = Schema.Struct({ event: Session.StoredEventSchema })
-const SessionsResponse = Schema.Struct({ sessions: Schema.Array(Session.SessionSummarySchema) })
-const HistoryResponse = Schema.Struct({ events: Schema.Array(Session.StoredEventSchema) })
+const CommitResponse = Schema.Struct({ commit: Session.CommitSchema })
+const SessionsResponse = Schema.Struct({
+  sessions: Schema.Array(Session.SessionSummarySchema)
+})
+const HistoryResponse = Schema.Struct({
+  history: Session.HistorySnapshotSchema
+})
 
 const proxyError = (cause: unknown): ProxyError => new ProxyError({
   message: cause instanceof Error ? cause.message : String(cause)
@@ -48,16 +63,19 @@ interface SseParserState {
   readonly data: ReadonlyArray<string>
 }
 
-const parseEventStream = (
+const parseActivityStream = (
   bytes: Stream.Stream<Uint8Array, unknown>
-): Stream.Stream<Session.StoredEvent, ProxyError> => bytes.pipe(
+): Stream.Stream<Session.HistoryItem, ProxyError> => bytes.pipe(
   Stream.decodeText,
   Stream.splitLines,
   Stream.mapAccum(
     (): SseParserState => ({ data: [] }),
     (state, line) => {
       if (line === "") {
-        return [{ data: [] }, state.data.length === 0 ? [] : [state.data.join("\n")]] as const
+        return [
+          { data: [] },
+          state.data.length === 0 ? [] : [state.data.join("\n")]
+        ] as const
       }
       if (line.startsWith("data:")) {
         const value = line.startsWith("data: ") ? line.slice(6) : line.slice(5)
@@ -70,7 +88,7 @@ const parseEventStream = (
     try: () => JSON.parse(data),
     catch: proxyError
   }).pipe(
-    Effect.flatMap(Schema.decodeUnknownEffect(Session.StoredEventSchema)),
+    Effect.flatMap(Schema.decodeUnknownEffect(Session.HistoryItemSchema)),
     Effect.mapError(proxyError)
   )),
   Stream.mapError(proxyError)
@@ -80,74 +98,111 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
   const client = yield* HttpClient.HttpClient
   const url = (path: string): string => `${baseUrl}${path}`
 
-  const responseJson = (request: HttpClientRequest.HttpClientRequest): Effect.Effect<unknown, ProxyError> =>
+  const execute = (request: HttpClientRequest.HttpClientRequest) =>
+    client.execute(request).pipe(Effect.mapError(proxyError))
+
+  const responseJson = (
+    request: HttpClientRequest.HttpClientRequest
+  ): Effect.Effect<unknown, ProxyError> => Effect.gen(function*() {
+    const response = yield* execute(request)
+    if (response.status < 200 || response.status >= 300) {
+      const detail = yield* response.text.pipe(
+        Effect.catch(() => Effect.succeed(""))
+      )
+      return yield* new ProxyError({
+        message: `Corredor API returned ${response.status}${
+          detail.length > 0 ? `: ${detail}` : ""
+        }`
+      })
+    }
+    return yield* response.json.pipe(Effect.mapError(proxyError))
+  })
+
+  const openActivityStream = (sessionId: string, after: number) =>
     Effect.gen(function*() {
-      const response = yield* client.execute(request).pipe(Effect.mapError(proxyError))
+      const request = HttpClientRequest.get(
+        url(
+          `/v1/sessions/${encodeURIComponent(sessionId)}/activity?after=${after}`
+        )
+      ).pipe(HttpClientRequest.accept("text/event-stream"))
+      const response = yield* execute(request)
       if (response.status < 200 || response.status >= 300) {
-        const detail = yield* response.text.pipe(Effect.catch(() => Effect.succeed("")))
         return yield* new ProxyError({
-          message: `Corredor API returned ${response.status}${detail.length > 0 ? `: ${detail}` : ""}`
+          message: `Activity stream returned ${response.status}`
         })
       }
-      return yield* response.json.pipe(Effect.mapError(proxyError))
+      return response
     })
-
-  const openEventStream = (sessionId: string, after: number) => Effect.gen(function*() {
-    const request = HttpClientRequest.get(
-      url(`/v1/sessions/${encodeURIComponent(sessionId)}/events?after=${after}`)
-    ).pipe(HttpClientRequest.accept("text/event-stream"))
-    const response = yield* client.execute(request).pipe(Effect.mapError(proxyError))
-    if (response.status < 200 || response.status >= 300) {
-      return yield* new ProxyError({ message: `Event stream returned ${response.status}` })
-    }
-    return response
-  })
 
   return Service.of({
     createSession: (sessionId) => Effect.gen(function*() {
-      const body = yield* responseJson(HttpClientRequest.post(url("/v1/sessions")).pipe(
-        HttpClientRequest.bodyJsonUnsafe(sessionId === undefined ? {} : { sessionId })
-      ))
-      const decoded = yield* Schema.decodeUnknownEffect(CreateSessionResponse)(body).pipe(Effect.mapError(proxyError))
-      return decoded.event as Session.StoredEvent
+      const body = yield* responseJson(
+        HttpClientRequest.post(url("/v1/sessions")).pipe(
+          HttpClientRequest.bodyJsonUnsafe(
+            sessionId === undefined ? {} : { sessionId }
+          )
+        )
+      )
+      const decoded = yield* Schema.decodeUnknownEffect(CreateSessionResponse)(
+        body
+      ).pipe(Effect.mapError(proxyError))
+      return decoded.session as Session.SessionCreated
     }),
-    sendMessage: (sessionId, messageId, content) => Effect.gen(function*() {
+    submitUserCommit: (sessionId, content, commitId) => Effect.gen(function*() {
       const body = yield* responseJson(HttpClientRequest.post(
-        url(`/v1/sessions/${encodeURIComponent(sessionId)}/messages`)
-      ).pipe(HttpClientRequest.bodyJsonUnsafe({ messageId, content })))
-      const decoded = yield* Schema.decodeUnknownEffect(EventResponse)(body).pipe(Effect.mapError(proxyError))
-      return decoded.event as Session.StoredEvent
+        url(`/v1/sessions/${encodeURIComponent(sessionId)}/commits`)
+      ).pipe(HttpClientRequest.bodyJsonUnsafe({ commitId, content })))
+      const decoded = yield* Schema.decodeUnknownEffect(CommitResponse)(body)
+        .pipe(Effect.mapError(proxyError))
+      return decoded.commit as Extract<
+        Session.Commit,
+        { readonly type: "UserCommit" }
+      >
     }),
     listSessions: () => Effect.gen(function*() {
-      const body = yield* responseJson(HttpClientRequest.get(url("/v1/sessions")))
-      const decoded = yield* Schema.decodeUnknownEffect(SessionsResponse)(body).pipe(Effect.mapError(proxyError))
+      const body = yield* responseJson(
+        HttpClientRequest.get(url("/v1/sessions"))
+      )
+      const decoded = yield* Schema.decodeUnknownEffect(SessionsResponse)(body)
+        .pipe(Effect.mapError(proxyError))
       return decoded.sessions as ReadonlyArray<Session.SessionSummary>
     }),
     history: (sessionId) => Effect.gen(function*() {
       const body = yield* responseJson(HttpClientRequest.get(
         url(`/v1/sessions/${encodeURIComponent(sessionId)}/history`)
       ))
-      const decoded = yield* Schema.decodeUnknownEffect(HistoryResponse)(body).pipe(Effect.mapError(proxyError))
-      return decoded.events as ReadonlyArray<Session.StoredEvent>
+      const decoded = yield* Schema.decodeUnknownEffect(HistoryResponse)(body)
+        .pipe(Effect.mapError(proxyError))
+      return decoded.history as Session.HistorySnapshot
     }),
-    navigateTree: (sessionId, targetId) => Effect.gen(function*() {
-      const body = yield* responseJson(HttpClientRequest.post(
-        url(`/v1/sessions/${encodeURIComponent(sessionId)}/tree`)
-      ).pipe(HttpClientRequest.bodyJsonUnsafe({ targetId })))
-      const decoded = yield* Schema.decodeUnknownEffect(EventResponse)(body).pipe(Effect.mapError(proxyError))
-      return decoded.event as Session.StoredEvent
+    checkout: (sessionId, commitId) => Effect.gen(function*() {
+      const response = yield* execute(HttpClientRequest.post(
+        url(`/v1/sessions/${encodeURIComponent(sessionId)}/head`)
+      ).pipe(HttpClientRequest.bodyJsonUnsafe({ commitId })))
+      if (response.status < 200 || response.status >= 300) {
+        const detail = yield* response.text.pipe(
+          Effect.catch(() => Effect.succeed(""))
+        )
+        return yield* new ProxyError({
+          message: `Corredor API returned ${response.status}${
+            detail.length > 0 ? `: ${detail}` : ""
+          }`
+        })
+      }
     }),
-    streamEvents: (sessionId, after = 0) => {
+    streamActivity: (sessionId, after = 0) => {
       let cursor = after
       const connection = Stream.suspend(() => Stream.unwrap(
-        openEventStream(sessionId, cursor).pipe(
-          Effect.map((response) => parseEventStream(response.stream))
+        openActivityStream(sessionId, cursor).pipe(
+          Effect.map((response) => parseActivityStream(response.stream))
         )
       ).pipe(
-        Stream.tap((event) => Effect.sync(() => {
-          cursor = Math.max(cursor, event.position)
+        Stream.tap((item) => Effect.sync(() => {
+          cursor = Math.max(cursor, item.position)
         })),
-        Stream.concat(Stream.fail(new ProxyError({ message: "Event stream closed" })))
+        Stream.concat(Stream.fail(
+          new ProxyError({ message: "Activity stream closed" })
+        ))
       ))
 
       return connection.pipe(Stream.retry(Schedule.spaced("500 millis")))
