@@ -75,7 +75,8 @@ class SessionPicker implements Component, Focusable {
     private readonly sessions: ReadonlyArray<SessionSummary>,
     private readonly onSelect: (sessionId: string) => void,
     private readonly onCancel: () => void,
-    private readonly requestRender: () => void
+    private readonly requestRender: () => void,
+    private readonly heading = "Resume Session"
   ) {}
 
   private filtered(): ReadonlyArray<SessionSummary> {
@@ -115,7 +116,7 @@ class SessionPicker implements Component, Focusable {
     const sessions = this.filtered()
     const lines = [
       "",
-      bold(cyan("  Resume Session")),
+      bold(cyan(`  ${this.heading}`)),
       dim(`  Search: ${this.query || "type to filter…"}`),
       dim(`  ${sessions.length} sessions · ${this.newestFirst ? "newest first" : "oldest first"}`),
       ""
@@ -128,7 +129,8 @@ class SessionPicker implements Component, Focusable {
       const title = session.title.replace(/\s+/g, " ")
       lines.push(truncateToWidth(`  ${prefix}${selected ? bold(title) : title}`, width))
       const id = this.showIds ? ` · ${session.sessionId}` : ""
-      lines.push(truncateToWidth(dim(`      ${new Date(session.updatedAt).toLocaleString()} · ${session.userCommitCount} User Commits${id}`), width))
+      const lifecycle = session.settled ? ` · ${yellow("Settled")}` : ""
+      lines.push(truncateToWidth(dim(`      ${new Date(session.updatedAt).toLocaleString()} · ${session.userCommitCount} User Commits${lifecycle}${id}`), width))
     }
     lines.push("", dim("  ↑↓ navigate · enter resume · type search · ctrl+s sort · ctrl+p IDs · esc cancel"), "")
     return lines.map((line) => truncateToWidth(line, width))
@@ -372,6 +374,8 @@ const make = (
 
   let sessionId = initialSessionId
   let branchHeadId: string | null = null
+  let settled = false
+  let lifecycleNotice: string | undefined
   let stopped = false
   let activeController: AbortController | undefined
   let streamController: AbortController | undefined
@@ -419,7 +423,10 @@ const make = (
   editor.setAutocompleteProvider(new CombinedAutocompleteProvider([
     { name: "new", description: "Start a new Session" },
     { name: "resume", description: "Resume a previous session" },
+    { name: "resume-settled", description: "Inspect a settled Session" },
     { name: "history", description: "Check out an earlier Commit" },
+    { name: "settle", description: "Settle the current Session" },
+    { name: "reopen", description: "Reopen the current Session" },
     { name: "exit", description: "Exit Corredor" }
   ], process.cwd()))
   editor.setAutocompleteMaxVisible(6)
@@ -483,6 +490,18 @@ const make = (
   const renderMessages = () => {
     messages.clear()
     const history = orderedHistory()
+    if (settled) {
+      messages.addChild(new Text(
+        bold(yellow("Session settled · use /reopen before continuing")),
+        1,
+        0
+      ))
+      messages.addChild(new Spacer(1))
+    }
+    if (lifecycleNotice !== undefined) {
+      messages.addChild(new Text(dim(lifecycleNotice), 1, 0))
+      messages.addChild(new Spacer(1))
+    }
     for (const record of Session.branchHistory(history, branchHeadId)) {
       Session.foldBranchRecord(record, {
         user: (entry) => addUserMessage(entry.content),
@@ -529,6 +548,20 @@ const make = (
     const itemId = Session.historyItemId(item)
     if (knownItems.has(itemId)) return
     knownItems.set(itemId, item)
+    if (item.type === "SessionSettled") {
+      settled = true
+      lifecycleNotice = "Session settled. History remains available for inspection."
+      activeController?.abort()
+      pending = undefined
+      finish()
+      return
+    }
+    if (item.type === "SessionReopened") {
+      settled = false
+      lifecycleNotice = "Session reopened. New work is available."
+      renderMessages()
+      return
+    }
     if (item.type === "UserCommit" && pending?.commitId === item.commitId) {
       branchHeadId = item.commitId
       pending.inReplyTo = item.commitId
@@ -552,6 +585,7 @@ const make = (
     void Effect.runPromise(proxy.history(id), { signal: controller.signal }).then((snapshot) => {
       if (stopped || controller.signal.aborted || streamController !== controller || sessionId !== id) return
       branchHeadId = snapshot.branchHeadId
+      settled = snapshot.settled
       for (const item of snapshot.items) {
         knownItems.set(Session.historyItemId(item), item)
       }
@@ -580,6 +614,8 @@ const make = (
     finish()
     sessionId = id
     branchHeadId = null
+    settled = false
+    lifecycleNotice = undefined
     knownItems.clear()
     errors.length = 0
     editor.setText("")
@@ -597,28 +633,33 @@ const make = (
     })
   }
 
-  const resumeSession = () => {
+  const resumeSession = (view: Session.SessionListView = "active") => {
     void Effect.runPromise(proxy.listWorkstreams()).then((workstreams) => {
       if (workstreams.length === 0) {
         addErrorMessage("No Workstreams found.")
         tui.requestRender()
         return
       }
-      const openSessions = (workstreamId: string) => {
-        void Effect.runPromise(proxy.workstream(workstreamId)).then((snapshot) => {
+      const loadSessionsForWorkstream = (workstreamId: string) => {
+        void Effect.runPromise(proxy.workstream(workstreamId, view)).then((snapshot) => {
           const previous = snapshot.sessions.filter(
             (session) => session.sessionId !== sessionId
           )
           if (previous.length === 0) {
             showConversation()
-            addErrorMessage("No previous Sessions found in this Workstream.")
+            addErrorMessage(
+              view === "settled"
+                ? "No settled Sessions found in this Workstream."
+                : "No previous Sessions found in this Workstream."
+            )
             return
           }
           const picker = new SessionPicker(
             previous,
             (selectedSessionId) => switchSession(selectedSessionId),
             showConversation,
-            () => tui.requestRender()
+            () => tui.requestRender(),
+            view === "settled" ? "Settled Sessions" : "Resume Session"
           )
           app.clear()
           app.addChild(picker)
@@ -631,7 +672,7 @@ const make = (
       }
       const picker = new WorkstreamPicker(
         workstreams,
-        openSessions,
+        loadSessionsForWorkstream,
         showConversation,
         () => tui.requestRender()
       )
@@ -650,6 +691,7 @@ const make = (
     void Effect.runPromise(proxy.history(treeSessionId)).then((snapshot) => {
       if (stopped || sessionId !== treeSessionId) return
       branchHeadId = snapshot.branchHeadId
+      settled = snapshot.settled
       for (const item of snapshot.items) {
         knownItems.set(Session.historyItemId(item), item)
       }
@@ -697,14 +739,42 @@ const make = (
     })
   }
 
+  const settleCurrentSession = () => {
+    void Effect.runPromise(proxy.settle(sessionId)).then((event) => {
+      if (stopped) return
+      renderActivity(event)
+    }).catch((error: unknown) => {
+      if (stopped) return
+      addErrorMessage(formatError(error))
+    })
+  }
+
+  const reopenCurrentSession = () => {
+    void Effect.runPromise(proxy.reopen(sessionId)).then((event) => {
+      if (stopped) return
+      renderActivity(event)
+    }).catch((error: unknown) => {
+      if (stopped) return
+      addErrorMessage(formatError(error))
+    })
+  }
+
   const submit = (input: string) => {
     const prompt = input.trim()
-    if (prompt.length === 0 || editor.disableSubmit || stopped) return
+    if (prompt.length === 0 || stopped) return
 
     if (prompt === "/exit") return stop()
     if (prompt === "/new") return startNewSession()
     if (prompt === "/resume") return resumeSession()
+    if (prompt === "/resume-settled") return resumeSession("settled")
     if (prompt === "/history" || prompt === "/tree") return openTree()
+    if (prompt === "/settle") return settleCurrentSession()
+    if (prompt === "/reopen") return reopenCurrentSession()
+    if (editor.disableSubmit) return
+    if (settled) {
+      addErrorMessage("Session is settled; use /reopen before continuing.")
+      return
+    }
 
     editor.addToHistory(prompt)
     editor.disableSubmit = true

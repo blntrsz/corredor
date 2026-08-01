@@ -341,3 +341,93 @@ it.live(
     expect(result.workstream.sessions).toEqual(result.sessions)
   })
 )
+
+it.live(
+  "settles and reopens Sessions through HTTP while keeping lifecycle activity reconnectable",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-settlement-http-")
+    const port = yield* Effect.promise(availablePort)
+    const baseUrl = `http://127.0.0.1:${port}`
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: () => Effect.succeed("not reached while settled")
+    }))
+    const layer = Layer.mergeAll(
+      Server.layerWithoutDependencies({ host: "127.0.0.1", port }),
+      AgentProxy.layer({ baseUrl })
+    ).pipe(
+      Layer.provide(Session.layer(path)),
+      Layer.provide(fakeAgent)
+    )
+
+    const result = yield* Effect.gen(function*() {
+      const proxy = yield* AgentProxy.Service
+      const session = yield* proxy.createSession("settlement-http-session")
+      const activityFiber = yield* proxy.streamActivity(
+        session.sessionId,
+        session.position
+      ).pipe(
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkScoped
+      )
+      const settled = yield* proxy.settle(session.sessionId)
+      const activeSessions = yield* proxy.listSessions()
+      const settledSessions = yield* proxy.listSessions(undefined, "settled")
+      const inspectedSettled = yield* proxy.workstream(
+        Session.defaultWorkstreamId,
+        "settled"
+      )
+      const history = yield* proxy.history(session.sessionId)
+      const checkoutError = yield* Effect.flip(proxy.checkout(
+        session.sessionId,
+        null
+      ))
+      const commitError = yield* Effect.flip(proxy.submitUserCommit(
+        session.sessionId,
+        "must wait for reopening",
+        "settlement-http-rejected"
+      ))
+      const runError = yield* Effect.flip(proxy.startAgentRun(
+        session.sessionId,
+        "missing-while-settled",
+        Agent.defaultDefinition
+      ))
+      const reopened = yield* proxy.reopen(session.sessionId)
+      const activity = Array.from(yield* Fiber.join(activityFiber))
+      return {
+        session,
+        settled,
+        activeSessions,
+        settledSessions,
+        inspectedSettled,
+        history,
+        checkoutError,
+        commitError,
+        runError,
+        reopened,
+        activity
+      }
+    }).pipe(Effect.provide(layer))
+
+    expect(result.settled).toMatchObject({ type: "SessionSettled" })
+    expect(result.reopened).toMatchObject({ type: "SessionReopened" })
+    expect(result.activeSessions).toEqual([])
+    expect(result.settledSessions).toEqual([
+      expect.objectContaining({
+        sessionId: result.session.sessionId,
+        settled: true
+      })
+    ])
+    expect(result.inspectedSettled.workstream.sessionCount).toBe(1)
+    expect(result.inspectedSettled.sessions[0]).toMatchObject({ settled: true })
+    expect(result.history.settled).toBe(true)
+    expect(result.history.items.map((item) => item.type)).toContain("SessionSettled")
+    expect(result.checkoutError.message).toContain("409")
+    expect(result.commitError.message).toContain("409")
+    expect(result.runError.message).toContain("409")
+    expect(result.activity.map((item) => item.type)).toEqual([
+      "SessionSettled",
+      "SessionReopened"
+    ])
+  })
+)

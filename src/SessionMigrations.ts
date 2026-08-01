@@ -181,6 +181,12 @@ const addWorkstreams = Effect.gen(function*() {
   GROUP BY session_id`
 })
 
+/** Persist reversible Session lifecycle state independently of Commit history. */
+const addSessionSettlement = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`ALTER TABLE sessions ADD COLUMN settled_at TEXT`
+})
+
 export const loader = SqliteMigrator.fromRecord({
   "1_create_session_events": createSessionEvents,
   "2_create_event_dispatch": createEventDispatch,
@@ -189,5 +195,6 @@ export const loader = SqliteMigrator.fromRecord({
   "5_add_failure_commit_causation": addFailureCommitCausation,
   "6_add_agent_run_identity": addAgentRunIdentity,
   "7_add_peer_branch_heads": addPeerBranchHeads,
-  "8_add_workstreams": addWorkstreams
+  "8_add_workstreams": addWorkstreams,
+  "9_add_session_settlement": addSessionSettlement
 })

@@ -88,6 +88,9 @@ export const make = Effect.gen(function*() {
   ) {
     const runId = requestedRunId
     const snapshot = yield* store.history(sessionId)
+    if (snapshot.settled) {
+      return yield* new Session.Settled({ sessionId })
+    }
     const startingCommit = snapshot.items.find(
       (item): item is Session.Commit =>
         Session.isCommit(item) && item.commitId === startingCommitId
@@ -182,6 +185,8 @@ export const make = Effect.gen(function*() {
       Agent.defaultDefinition,
       undefined,
       item.type === "UserCommit" ? item.peerId : undefined
+    ).pipe(
+      Effect.catchTag("@corredor/Session/Settled", () => Effect.void)
     )
   })
 
