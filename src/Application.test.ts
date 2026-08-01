@@ -10,10 +10,8 @@ import { temporaryDatabase } from "./TestSupport.ts"
 const runtimeLayer = (
   path: string,
   fakeAgent: Layer.Layer<Agent.Service>
-) => Layer.mergeAll(
-  Application.layerWithoutDependencies,
-  AgentRuntime.layerWithoutDependencies
-).pipe(
+) => Application.layerWithoutDependencies.pipe(
+  Layer.provide(AgentRuntime.layerWithoutDependencies),
   Layer.provide(Session.layer(path)),
   Layer.provide(fakeAgent),
   Layer.provide(BunCrypto.layer)
@@ -182,6 +180,43 @@ it.live(
 )
 
 it.live(
+  "an unexpected Agent failure becomes a durable Failure Commit",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-agent-failure-")
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: () => Effect.die("model process crashed")
+    }))
+
+    const failure = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const session = yield* application.createSession("agent-failure-session")
+      yield* application.submitUserCommit(
+        session.sessionId,
+        "Do the work",
+        "failure-user"
+      )
+
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const history = yield* application.history(session.sessionId)
+        const commit = history.items.find(
+          (item) => item.type === "FailureCommit"
+        )
+        if (commit?.type === "FailureCommit") return commit
+        yield* Effect.sleep("10 millis")
+      }
+      return yield* Effect.die("timed out waiting for Failure Commit")
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    expect(failure).toMatchObject({
+      type: "FailureCommit",
+      inReplyTo: "failure-user",
+      parentId: "failure-user"
+    })
+    expect(failure.reason).toContain("model process crashed")
+  })
+)
+
+it.live(
   "a restarted Agent Run resumes from durable Tool ancestry without replacing it",
   () => Effect.gen(function*() {
     const { path } = yield* temporaryDatabase("corredor-tool-restart-")
@@ -272,5 +307,138 @@ it.live(
       parentId: tools[1]?.commitId,
       content: "The current value is new."
     })
+  })
+)
+
+it.live(
+  "two explicit Agent Runs from one Commit create independent descendants",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-independent-runs-")
+    const contexts: Array<ReadonlyArray<Agent.ContextEntry>> = []
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (context) => Effect.sync(() => {
+        contexts.push(context)
+        return `response-${contexts.length}`
+      })
+    }))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const session = yield* application.createSession("independent-session")
+      const user = yield* application.submitUserCommit(
+        session.sessionId,
+        "Run this independently",
+        "independent-user"
+      )
+
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const history = yield* application.history(session.sessionId)
+        if (history.items.some((item) => item.type === "AgentMessageCommit")) {
+          break
+        }
+        yield* Effect.sleep("10 millis")
+      }
+
+      yield* application.startAgentRun(
+        session.sessionId,
+        user.commitId,
+        "independent-run-a"
+      )
+      yield* application.startAgentRun(
+        session.sessionId,
+        user.commitId,
+        "independent-run-b"
+      )
+      return yield* application.history(session.sessionId)
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    const messages = result.items.filter(
+      (item): item is Extract<Session.Commit, { type: "AgentMessageCommit" }> =>
+        item.type === "AgentMessageCommit"
+    )
+    expect(messages).toEqual([
+      expect.objectContaining({
+        inReplyTo: "independent-user",
+        parentId: "independent-user"
+      }),
+      expect.objectContaining({
+        inReplyTo: "independent-user",
+        runId: "independent-run-a",
+        parentId: "independent-user"
+      }),
+      expect.objectContaining({
+        inReplyTo: "independent-user",
+        runId: "independent-run-b",
+        parentId: "independent-user"
+      })
+    ])
+    expect(contexts).toHaveLength(3)
+    expect(contexts.every((context) => context.map((entry) => entry.type).join() === "User"))
+      .toBe(true)
+  })
+)
+
+it.live(
+  "recreates the runtime between turns from the public application boundary",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-runtime-restart-")
+    let firstSessionId = ""
+
+    const firstAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: () => Effect.succeed("First durable answer")
+    }))
+    yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const session = yield* application.createSession("runtime-restart-session")
+      firstSessionId = session.sessionId
+      yield* application.submitUserCommit(
+        session.sessionId,
+        "First turn",
+        "runtime-first-user"
+      )
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const history = yield* application.history(session.sessionId)
+        if (history.items.some((item) => item.type === "AgentMessageCommit")) return
+        yield* Effect.sleep("10 millis")
+      }
+      return yield* Effect.die("timed out waiting for first runtime")
+    }).pipe(Effect.provide(runtimeLayer(path, firstAgent)))
+
+    let secondContext: ReadonlyArray<Agent.ContextEntry> = []
+    const secondAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (context) => Effect.gen(function*() {
+        secondContext = context
+        return "Second durable answer"
+      })
+    }))
+    const history = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      yield* application.submitUserCommit(
+        firstSessionId,
+        "Second turn",
+        "runtime-second-user"
+      )
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const snapshot = yield* application.history(firstSessionId)
+        if (snapshot.items.some(
+          (item) => item.type === "AgentMessageCommit" &&
+            item.content === "Second durable answer"
+        )) return snapshot
+        yield* Effect.sleep("10 millis")
+      }
+      return yield* Effect.die("timed out waiting for restarted runtime")
+    }).pipe(Effect.provide(runtimeLayer(path, secondAgent)))
+
+    expect(secondContext.map((entry) => entry.type)).toEqual([
+      "User",
+      "AgentMessage",
+      "User"
+    ])
+    expect(history.items.filter(Session.isCommit)).toEqual([
+      expect.objectContaining({ type: "UserCommit", commitId: "runtime-first-user" }),
+      expect.objectContaining({ type: "AgentMessageCommit", content: "First durable answer" }),
+      expect.objectContaining({ type: "UserCommit", commitId: "runtime-second-user" }),
+      expect.objectContaining({ type: "AgentMessageCommit", content: "Second durable answer" })
+    ])
   })
 )

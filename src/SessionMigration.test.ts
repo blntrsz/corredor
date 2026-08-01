@@ -8,7 +8,10 @@ import { temporaryDatabase } from "./TestSupport.ts"
 it.live("legacy user, agent, tool-call-only, and navigation history remains readable without rewriting", () =>
   Effect.gen(function*() {
     const { path } = yield* temporaryDatabase("corredor-legacy-")
-    const database = new Database(path)
+    const database = yield* Effect.acquireRelease(
+      Effect.sync(() => new Database(path)),
+      (connection) => Effect.sync(() => connection.close())
+    )
 
     database.exec(`
       CREATE TABLE effect_sql_migrations (
@@ -67,8 +70,6 @@ it.live("legacy user, agent, tool-call-only, and navigation history remains read
         (4, 'agent-legacy'),
         (5, 'navigation-legacy');
     `)
-    database.close()
-
     const result = yield* Effect.gen(function*() {
       const store = yield* Session.make(path)
       const history = yield* store.history("legacy-session")
@@ -79,12 +80,13 @@ it.live("legacy user, agent, tool-call-only, and navigation history remains read
       )
       return { history, continued }
     }).pipe(Effect.provide(BunCrypto.layer))
-    const migrated = new Database(path, { readonly: true })
+    const migrated = yield* Effect.acquireRelease(
+      Effect.sync(() => new Database(path, { readonly: true })),
+      (connection) => Effect.sync(() => connection.close())
+    )
     const rawTypes = migrated.query(
       "SELECT event_type AS type FROM session_events ORDER BY sequence"
     ).all() as ReadonlyArray<{ readonly type: string }>
-    migrated.close()
-
     expect(result.history.items.map((item) => item.type)).toEqual([
       "SessionCreated",
       "UserCommit",

@@ -54,6 +54,11 @@ curl http://127.0.0.1:5050/v1/sessions/$SESSION_ID/history
 # Checkout a Commit as the local Branch Head (use null for an empty Branch).
 curl -X POST http://127.0.0.1:5050/v1/sessions/$SESSION_ID/head \
   -H 'content-type: application/json' -d '{"commitId":"COMMIT_ID"}'
+
+# Start another independent Agent Run from an existing Commit.
+curl -X POST http://127.0.0.1:5050/v1/sessions/$SESSION_ID/runs \
+  -H 'content-type: application/json' \
+  -d '{"commitId":"COMMIT_ID","runId":"independent-run-id"}'
 ```
 
 ## Commit flow
@@ -72,6 +77,8 @@ Submit User Commit -> UserCommit -> durable outbox
 outbox with a global position, and `event_consumer_checkpoints` records durable
 consumer acknowledgements. The server-owned Agent Runtime reacts to User
 Commits and starts each Agent Run statelessly from durable Commit ancestry.
+Explicit runs can start from any existing Commit; provide a distinct `runId`
+to create an independent descendant from the same starting point.
 
 The TUI is a thin client. `AgentProxy` creates Sessions and submits User Commits
 over HTTP, then renders the Session's SSE activity stream. It does not open

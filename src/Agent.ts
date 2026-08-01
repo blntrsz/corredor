@@ -114,6 +114,11 @@ export namespace Agent {
         readonly value: unknown
       }
     }
+    | {
+      readonly type: "Failure"
+      readonly commitId: string
+      readonly reason: string
+    }
 
   export interface Interface {
     /**
@@ -155,6 +160,12 @@ export namespace Agent {
           }
           if (entry.type === "AgentMessage") {
             return { role: "assistant" as const, content: entry.content }
+          }
+          if (entry.type === "Failure") {
+            return {
+              role: "assistant" as const,
+              content: `[Previous Agent Run failed: ${entry.reason}]`
+            }
           }
           const outcome = entry.outcome.type === "Success"
             ? { result: entry.outcome.value }

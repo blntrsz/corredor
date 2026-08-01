@@ -1,5 +1,6 @@
 import { BunCrypto } from "@effect/platform-bun"
 import { Context, Crypto, Effect, Layer } from "effect"
+import * as AgentRuntime from "./AgentRuntime.ts"
 import * as Session from "./Session.ts"
 
 /**
@@ -18,6 +19,11 @@ export interface Interface {
     Extract<Session.Commit, { readonly type: "UserCommit" }>,
     Session.Error
   >
+  readonly startAgentRun: (
+    sessionId: string,
+    startingCommitId: string,
+    runId?: string
+  ) => Effect.Effect<void, Session.Error | Session.PersistenceError>
   readonly checkout: (
     sessionId: string,
     commitId: string | null
@@ -41,6 +47,7 @@ export class Service extends Context.Service<Service, Interface>()(
 
 export const make = Effect.gen(function*() {
   const store = yield* Session.Service
+  const runtime = yield* AgentRuntime.Service
   const crypto = yield* Crypto.Crypto
   const randomId = crypto.randomUUIDv4.pipe(
     Effect.mapError((cause) => new Session.PersistenceError({
@@ -61,6 +68,11 @@ export const make = Effect.gen(function*() {
           content,
           requestedId ?? (yield* randomId)
         )
+      }
+    ),
+    startAgentRun: Effect.fn("Application.startAgentRun")(
+      function*(sessionId: string, startingCommitId: string, runId?: string) {
+        yield* runtime.start(sessionId, startingCommitId, runId)
       }
     ),
     checkout: Effect.fn("Application.checkout")(
@@ -84,7 +96,8 @@ export const make = Effect.gen(function*() {
 
 export const layerWithoutDependencies = Layer.effect(Service, make)
 
-export const layer = layerWithoutDependencies.pipe(
-  Layer.provide(Session.layer()),
-  Layer.provide(BunCrypto.layer)
-)
+export const layer = (path = Session.defaultDatabasePath) =>
+  layerWithoutDependencies.pipe(
+    Layer.provide(AgentRuntime.layer(path)),
+    Layer.provide(BunCrypto.layer)
+  )
