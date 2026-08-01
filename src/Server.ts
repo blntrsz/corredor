@@ -13,9 +13,44 @@ import * as Session from "./Session.ts"
 const peerIdFrom = (request: HttpServerRequest.HttpServerRequest): string =>
   request.headers["x-corredor-peer-id"]?.trim() || Session.defaultPeerId
 
+const sessionViewFrom = (
+  request: HttpServerRequest.HttpServerRequest
+): Session.SessionListView => {
+  const params = new URL(request.originalUrl).searchParams
+  const state = params.get("state")
+  if (state === "settled") return "settled"
+  return "active"
+}
+
 const internalServerError = () => HttpServerResponse.jsonUnsafe(
   { error: "internal server error" },
   { status: 500 }
+)
+
+const missingSessionId = () => HttpServerResponse.jsonUnsafe(
+  { error: "missing session id" },
+  { status: 400 }
+)
+
+const sessionNotFound = (error: Session.NotFound) => Effect.succeed(
+  HttpServerResponse.jsonUnsafe(
+    { error: `Session not found: ${error.sessionId}` },
+    { status: 404 }
+  )
+)
+
+const sessionSettled = (error: Session.Settled) => Effect.succeed(
+  HttpServerResponse.jsonUnsafe(
+    { error: `Session is settled: ${error.sessionId}` },
+    { status: 409 }
+  )
+)
+
+const commitNotFound = (error: Session.CommitNotFound) => Effect.succeed(
+  HttpServerResponse.jsonUnsafe(
+    { error: `Commit not found: ${error.commitId}` },
+    { status: 404 }
+  )
 )
 
 const health = Session.Service.pipe(
@@ -95,6 +130,7 @@ const listWorkstreams = Effect.gen(function*() {
 const inspectWorkstream = Effect.gen(function*() {
   const application = yield* Application.Service
   const params = yield* HttpRouter.params
+  const request = yield* HttpServerRequest.HttpServerRequest
   const workstreamId = params.workstreamId
   if (workstreamId === undefined) {
     return HttpServerResponse.jsonUnsafe(
@@ -103,7 +139,7 @@ const inspectWorkstream = Effect.gen(function*() {
     )
   }
   return HttpServerResponse.jsonUnsafe(
-    yield* application.workstream(workstreamId)
+    yield* application.workstream(workstreamId, sessionViewFrom(request))
   )
 }).pipe(
   Effect.catchTag("@corredor/Session/WorkstreamNotFound", (error) => Effect.succeed(
@@ -120,7 +156,7 @@ const listSessions = Effect.gen(function*() {
   const request = yield* HttpServerRequest.HttpServerRequest
   const workstreamId = new URL(request.originalUrl).searchParams.get("workstreamId") ?? undefined
   return HttpServerResponse.jsonUnsafe({
-    sessions: yield* application.listSessions(workstreamId)
+    sessions: yield* application.listSessions(workstreamId, sessionViewFrom(request))
   })
 }).pipe(Effect.catchCause(() => Effect.succeed(internalServerError())))
 
@@ -135,10 +171,7 @@ const submitUserCommit = Effect.gen(function*() {
   }))(yield* request.json)
   const sessionId = params.sessionId
   if (sessionId === undefined) {
-    return HttpServerResponse.jsonUnsafe(
-      { error: "missing session id" },
-      { status: 400 }
-    )
+    return missingSessionId()
   }
   const peerId = peerIdFrom(request)
   const commit = yield* application.submitUserCommit(
@@ -148,7 +181,11 @@ const submitUserCommit = Effect.gen(function*() {
     peerId
   )
   return HttpServerResponse.jsonUnsafe({ commit }, { status: 202 })
-}).pipe(Effect.orDie)
+}).pipe(
+  Effect.catchTag("@corredor/Session/NotFound", sessionNotFound),
+  Effect.catchTag("@corredor/Session/Settled", sessionSettled),
+  Effect.catchCause(() => Effect.succeed(internalServerError()))
+)
 
 const sessionHistory = Effect.gen(function*() {
   const application = yield* Application.Service
@@ -156,10 +193,7 @@ const sessionHistory = Effect.gen(function*() {
   const request = yield* HttpServerRequest.HttpServerRequest
   const sessionId = params.sessionId
   if (sessionId === undefined) {
-    return HttpServerResponse.jsonUnsafe(
-      { error: "missing session id" },
-      { status: 400 }
-    )
+    return missingSessionId()
   }
   return HttpServerResponse.jsonUnsafe({
     history: yield* application.history(sessionId, peerIdFrom(request))
@@ -177,10 +211,7 @@ const startAgentRun = Effect.gen(function*() {
   }))(yield* request.json)
   const sessionId = params.sessionId
   if (sessionId === undefined) {
-    return HttpServerResponse.jsonUnsafe(
-      { error: "missing session id" },
-      { status: 400 }
-    )
+    return missingSessionId()
   }
   const peerId = peerIdFrom(request)
   yield* application.startAgentRun(
@@ -195,7 +226,12 @@ const startAgentRun = Effect.gen(function*() {
     commitId: body.commitId,
     runId: body.runId ?? body.commitId
   }, { status: 202 })
-}).pipe(Effect.orDie)
+}).pipe(
+  Effect.catchTag("@corredor/Session/NotFound", sessionNotFound),
+  Effect.catchTag("@corredor/Session/Settled", sessionSettled),
+  Effect.catchTag("@corredor/Session/CommitNotFound", commitNotFound),
+  Effect.catchCause(() => Effect.succeed(internalServerError()))
+)
 
 const checkout = Effect.gen(function*() {
   const application = yield* Application.Service
@@ -203,10 +239,7 @@ const checkout = Effect.gen(function*() {
   const request = yield* HttpServerRequest.HttpServerRequest
   const sessionId = params.sessionId
   if (sessionId === undefined) {
-    return HttpServerResponse.jsonUnsafe(
-      { error: "missing session id" },
-      { status: 400 }
-    )
+    return missingSessionId()
   }
   const body = yield* Schema.decodeUnknownEffect(Schema.Struct({
     commitId: Schema.optional(Schema.NullOr(Schema.String)),
@@ -219,7 +252,52 @@ const checkout = Effect.gen(function*() {
     peerId
   )
   return HttpServerResponse.empty({ status: 204 })
-}).pipe(Effect.orDie)
+}).pipe(
+  Effect.catchTag("@corredor/Session/NotFound", sessionNotFound),
+  Effect.catchTag("@corredor/Session/Settled", sessionSettled),
+  Effect.catchTag("@corredor/Session/CommitNotFound", commitNotFound),
+  Effect.catchCause(() => Effect.succeed(internalServerError()))
+)
+
+const settleSession = Effect.gen(function*() {
+  const application = yield* Application.Service
+  const params = yield* HttpRouter.params
+  const sessionId = params.sessionId
+  if (sessionId === undefined) {
+    return missingSessionId()
+  }
+  const event = yield* application.settle(sessionId)
+  return HttpServerResponse.jsonUnsafe({ event })
+}).pipe(
+  Effect.catchTag("@corredor/Session/NotFound", sessionNotFound),
+  Effect.catchTag("@corredor/Session/AlreadySettled", (error) => Effect.succeed(
+    HttpServerResponse.jsonUnsafe(
+      { error: `Session already settled: ${error.sessionId}` },
+      { status: 409 }
+    )
+  )),
+  Effect.catchCause(() => Effect.succeed(internalServerError()))
+)
+
+const reopenSession = Effect.gen(function*() {
+  const application = yield* Application.Service
+  const params = yield* HttpRouter.params
+  const sessionId = params.sessionId
+  if (sessionId === undefined) {
+    return missingSessionId()
+  }
+  const event = yield* application.reopen(sessionId)
+  return HttpServerResponse.jsonUnsafe({ event })
+}).pipe(
+  Effect.catchTag("@corredor/Session/NotFound", sessionNotFound),
+  Effect.catchTag("@corredor/Session/NotSettled", (error) => Effect.succeed(
+    HttpServerResponse.jsonUnsafe(
+      { error: `Session is not settled: ${error.sessionId}` },
+      { status: 409 }
+    )
+  )),
+  Effect.catchCause(() => Effect.succeed(internalServerError()))
+)
 
 const encoder = new TextEncoder()
 const encodeSse = (item: Session.HistoryItem): Uint8Array => encoder.encode(
@@ -237,10 +315,7 @@ const sessionActivity = Effect.gen(function*() {
   const request = yield* HttpServerRequest.HttpServerRequest
   const sessionId = params.sessionId
   if (sessionId === undefined) {
-    return HttpServerResponse.jsonUnsafe(
-      { error: "missing session id" },
-      { status: 400 }
-    )
+    return missingSessionId()
   }
 
   const requestedAfter = new URL(request.originalUrl).searchParams.get("after")
@@ -319,6 +394,8 @@ const routes = Layer.mergeAll(
     "/v1/sessions/:sessionId/runs",
     startAgentRun
   ),
+  HttpRouter.add("POST", "/v1/sessions/:sessionId/settle", settleSession),
+  HttpRouter.add("POST", "/v1/sessions/:sessionId/reopen", reopenSession),
   HttpRouter.add("POST", "/v1/sessions/:sessionId/head", checkout),
   HttpRouter.add("POST", "/v1/sessions/:sessionId/tree", checkout),
   HttpRouter.add(

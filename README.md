@@ -61,6 +61,20 @@ curl -X POST http://127.0.0.1:5050/v1/sessions/$SESSION_ID/runs \
   -d '{"commitId":"COMMIT_ID","agent":{"id":"default","instructions":"You are a helpful assistant.","tools":["Bash"]},"runId":"independent-run-id"}'
 ```
 
+Sessions can be settled and reopened without removing their history. Default
+Session listings contain active Sessions; use `?state=settled` to inspect
+settled Sessions. Settlement and reopening are also emitted through the
+activity stream:
+
+```bash
+curl -X POST http://127.0.0.1:5050/v1/sessions/$SESSION_ID/settle
+curl http://127.0.0.1:5050/v1/sessions?state=settled
+curl -X POST http://127.0.0.1:5050/v1/sessions/$SESSION_ID/reopen
+```
+
+History inspection remains available while settled, but Checkout, User
+Commits, and Agent Runs are rejected until the Session is reopened.
+
 ## Commit flow
 
 ```text

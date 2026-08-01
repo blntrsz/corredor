@@ -80,6 +80,24 @@ export interface SessionCreated {
   readonly workstreamId?: string
 }
 
+export interface SessionSettled {
+  readonly type: "SessionSettled"
+  readonly activityId: string
+  readonly sessionId: string
+  readonly sequence: number
+  readonly position: number
+  readonly occurredAt: string
+}
+
+export interface SessionReopened {
+  readonly type: "SessionReopened"
+  readonly activityId: string
+  readonly sessionId: string
+  readonly sequence: number
+  readonly position: number
+  readonly occurredAt: string
+}
+
 export interface LegacyNavigation {
   readonly type: "LegacyNavigation"
   readonly activityId: string
@@ -90,7 +108,13 @@ export interface LegacyNavigation {
   readonly targetId: string | null
 }
 
-export type HistoryItem = Commit | LegacyToolCall | SessionCreated | LegacyNavigation
+export type HistoryItem =
+  | Commit
+  | LegacyToolCall
+  | SessionCreated
+  | SessionSettled
+  | SessionReopened
+  | LegacyNavigation
 export type BranchRecord = Commit | LegacyToolCall
 
 type UserCommit = Extract<Commit, { readonly type: "UserCommit" }>
@@ -121,6 +145,7 @@ export const foldBranchRecord = <A>(
 export interface HistorySnapshot {
   readonly items: ReadonlyArray<HistoryItem>
   readonly branchHeadId: string | null
+  readonly settled: boolean
 }
 
 /** Used when callers have not configured an explicit Peer identity. */
@@ -197,6 +222,20 @@ export const SessionCreatedSchema = Schema.Struct({
   workstreamId: Schema.optional(Schema.String)
 })
 
+export const SessionSettledSchema = Schema.Struct({
+  ...historyMetadata,
+  type: Schema.Literal("SessionSettled"),
+  activityId: Schema.String,
+  occurredAt: Schema.String
+})
+
+export const SessionReopenedSchema = Schema.Struct({
+  ...historyMetadata,
+  type: Schema.Literal("SessionReopened"),
+  activityId: Schema.String,
+  occurredAt: Schema.String
+})
+
 /** Runtime decoder shared by the HTTP client and SSE transport. */
 export const HistoryItemSchema = Schema.Union([
   UserCommitSchema,
@@ -216,6 +255,8 @@ export const HistoryItemSchema = Schema.Union([
     index: Schema.Number
   }),
   SessionCreatedSchema,
+  SessionSettledSchema,
+  SessionReopenedSchema,
   Schema.Struct({
     ...historyMetadata,
     type: Schema.Literal("LegacyNavigation"),
@@ -234,7 +275,8 @@ export const CommitSchema = Schema.Union([
 
 export const HistorySnapshotSchema = Schema.Struct({
   items: Schema.Array(HistoryItemSchema),
-  branchHeadId: Schema.NullOr(Schema.String)
+  branchHeadId: Schema.NullOr(Schema.String),
+  settled: Schema.Boolean
 })
 
 export class PersistenceError extends Schema.TaggedErrorClass<PersistenceError>()(
@@ -269,6 +311,18 @@ export class ToolCommitConflict extends Schema.TaggedErrorClass<ToolCommitConfli
     index: Schema.Number
   }
 ) {}
+export class Settled extends Schema.TaggedErrorClass<Settled>()(
+  "@corredor/Session/Settled",
+  { sessionId: Schema.String }
+) {}
+export class AlreadySettled extends Schema.TaggedErrorClass<AlreadySettled>()(
+  "@corredor/Session/AlreadySettled",
+  { sessionId: Schema.String }
+) {}
+export class NotSettled extends Schema.TaggedErrorClass<NotSettled>()(
+  "@corredor/Session/NotSettled",
+  { sessionId: Schema.String }
+) {}
 export type Error =
   | PersistenceError
   | AlreadyExists
@@ -277,6 +331,11 @@ export type Error =
   | NotFound
   | CommitNotFound
   | ToolCommitConflict
+  | Settled
+  | AlreadySettled
+  | NotSettled
+
+export type SessionListView = "active" | "settled"
 
 export interface SessionSummary {
   readonly sessionId: string
@@ -285,6 +344,7 @@ export interface SessionSummary {
   readonly updatedAt: string
   readonly title: string
   readonly userCommitCount: number
+  readonly settled: boolean
 }
 
 export const SessionSummarySchema = Schema.Struct({
@@ -293,7 +353,8 @@ export const SessionSummarySchema = Schema.Struct({
   createdAt: Schema.String,
   updatedAt: Schema.String,
   title: Schema.String,
-  userCommitCount: Schema.Number
+  userCommitCount: Schema.Number,
+  settled: Schema.Boolean
 })
 
 export interface Workstream {
@@ -450,13 +511,20 @@ export interface Interface {
   ) => Effect.Effect<Workstream, Error>
   readonly listWorkstreams: () => Effect.Effect<ReadonlyArray<WorkstreamSummary>, PersistenceError>
   readonly workstream: (
-    workstreamId: string
+    workstreamId: string,
+    view?: SessionListView
   ) => Effect.Effect<WorkstreamSnapshot, PersistenceError | WorkstreamNotFound>
   readonly createSession: (
     sessionId: string,
     workstreamId?: string,
     peerId?: string
   ) => Effect.Effect<SessionCreated, Error>
+  readonly settle: (
+    sessionId: string
+  ) => Effect.Effect<SessionSettled, Error>
+  readonly reopen: (
+    sessionId: string
+  ) => Effect.Effect<SessionReopened, Error>
   readonly appendUserCommit: (
     sessionId: string,
     content: string,
@@ -498,7 +566,8 @@ export interface Interface {
     peerId?: string
   ) => Effect.Effect<HistorySnapshot, PersistenceError>
   readonly listSessions: (
-    workstreamId?: string
+    workstreamId?: string,
+    view?: SessionListView
   ) => Effect.Effect<ReadonlyArray<SessionSummary>, PersistenceError>
   readonly activityAfter: (position: number, limit?: number) => Effect.Effect<ReadonlyArray<HistoryItem>, PersistenceError>
   readonly checkpoint: (consumer: string) => Effect.Effect<number, PersistenceError>
@@ -516,6 +585,8 @@ type RawEventType =
   | "AgentToolCallAdded"
   | "AgentMessageAdded"
   | "SessionTreeNavigated"
+  | "SessionSettled"
+  | "SessionReopened"
 
 interface EventRow {
   readonly position: number
@@ -566,6 +637,16 @@ const decodeHistory = (rows: ReadonlyArray<EventRow>): ReadonlyArray<HistoryItem
         activityId: row.event_id,
         occurredAt: row.occurred_at,
         targetId
+      })
+      continue
+    }
+
+    if (row.event_type === "SessionSettled" || row.event_type === "SessionReopened") {
+      items.push({
+        ...metadata,
+        type: row.event_type,
+        activityId: row.event_id,
+        occurredAt: row.occurred_at
       })
       continue
     }
@@ -698,44 +779,52 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
 
   const sessionSummaryRows = (workstreamId?: string) => workstreamId === undefined
     ? sql<{
-      readonly sessionId: string
-      readonly workstreamId: string
-      readonly createdAt: string
-      readonly updatedAt: string
-      readonly title: string
-      readonly userCommitCount: number
-    }>`SELECT
+        readonly sessionId: string
+        readonly workstreamId: string
+        readonly createdAt: string
+        readonly updatedAt: string
+        readonly title: string
+        readonly userCommitCount: number
+        readonly settled: number
+      }>`SELECT
         s.session_id AS sessionId,
         s.workstream_id AS workstreamId,
         s.created_at AS createdAt,
         s.updated_at AS updatedAt,
         s.title AS title,
         SUM(CASE WHEN e.event_type IN ('UserCommit','UserMessageAdded') THEN 1 ELSE 0 END)
-          AS userCommitCount
+          AS userCommitCount,
+        CASE WHEN s.settled_at IS NULL THEN 0 ELSE 1 END AS settled
       FROM sessions s
       JOIN session_events e ON e.session_id=s.session_id
       GROUP BY s.session_id
       ORDER BY s.updated_at DESC`
+
     : sql<{
       readonly sessionId: string
       readonly workstreamId: string
-      readonly createdAt: string
-      readonly updatedAt: string
-      readonly title: string
-      readonly userCommitCount: number
-    }>`SELECT
+        readonly createdAt: string
+        readonly updatedAt: string
+        readonly title: string
+        readonly userCommitCount: number
+        readonly settled: number
+      }>`SELECT
         s.session_id AS sessionId,
         s.workstream_id AS workstreamId,
         s.created_at AS createdAt,
         s.updated_at AS updatedAt,
         s.title AS title,
         SUM(CASE WHEN e.event_type IN ('UserCommit','UserMessageAdded') THEN 1 ELSE 0 END)
-          AS userCommitCount
+          AS userCommitCount,
+        CASE WHEN s.settled_at IS NULL THEN 0 ELSE 1 END AS settled
       FROM sessions s
       JOIN session_events e ON e.session_id=s.session_id
       WHERE s.workstream_id=${workstreamId}
       GROUP BY s.session_id
       ORDER BY s.updated_at DESC`
+
+  const includeSession = (settled: number, view: SessionListView): boolean =>
+    view === "settled" ? settled !== 0 : settled === 0
 
   // Derive the default Peer's local Branch Head once for legacy Sessions. No
   // legacy row is rewritten, and later Checkout operations update only local
@@ -788,6 +877,11 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       : undefined
     yield* sql`UPDATE sessions
       SET updated_at=${occurredAt},
+          settled_at=CASE
+            WHEN ${type}='SessionSettled' THEN ${occurredAt}
+            WHEN ${type}='SessionReopened' THEN NULL
+            ELSE settled_at
+          END,
           title=CASE WHEN ${title ?? null} IS NOT NULL AND title='New session'
             THEN ${title ?? null} ELSE title END
       WHERE session_id=${sessionId}`
@@ -800,6 +894,43 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     INSERT OR IGNORE INTO peer_branch_heads (peer_id, session_id, commit_id)
     VALUES (${peerId}, ${sessionId}, NULL)
   `
+
+  const sessionState = (sessionId: string) => sql<{
+    readonly settledAt: string | null
+  }>`SELECT settled_at AS settledAt FROM sessions WHERE session_id=${sessionId}`
+
+  type LifecycleTransitionResult =
+    | { readonly type: "NotFound" }
+    | { readonly type: "AlreadySettled" }
+    | { readonly type: "NotSettled" }
+    | { readonly type: "Settled"; readonly item: SessionSettled }
+    | { readonly type: "Reopened"; readonly item: SessionReopened }
+
+  const transitionSession = (
+    sessionId: string,
+    eventType: "SessionSettled" | "SessionReopened"
+  ): Effect.Effect<LifecycleTransitionResult, PersistenceError> => Effect.gen(function*() {
+    const rows = yield* sessionRows(sessionId)
+    if (rows.length === 0) return { type: "NotFound" as const }
+    const state = yield* sessionState(sessionId)
+    const settled = state[0]?.settledAt !== null && state[0]?.settledAt !== undefined
+    if (eventType === "SessionSettled" && settled) {
+      return { type: "AlreadySettled" as const }
+    }
+    if (eventType === "SessionReopened" && !settled) {
+      return { type: "NotSettled" as const }
+    }
+    const item = yield* insert(
+      sessionId,
+      yield* randomId,
+      eventType,
+      {},
+      rows.at(-1)!.sequence + 1
+    )
+    return eventType === "SessionSettled"
+      ? { type: "Settled" as const, item: item as SessionSettled }
+      : { type: "Reopened" as const, item: item as SessionReopened }
+  }).pipe(sql.withTransaction, persist)
 
   const updateHeadIfCurrent = (
     sessionId: string,
@@ -832,6 +963,7 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
   type ResponseCommitType = "AgentMessageCommit" | "FailureCommit"
   type ResponseCommitResult =
     | { readonly type: "NotFound" }
+    | { readonly type: "Settled" }
     | { readonly type: "CommitNotFound"; readonly commitId: string }
     | { readonly type: "Appended"; readonly item: Commit }
 
@@ -846,12 +978,16 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
   ): Effect.Effect<ResponseCommitResult, PersistenceError> => Effect.gen(function*() {
     const rows = yield* sessionRows(sessionId)
     if (rows.length === 0) return { type: "NotFound" as const }
-    yield* ensurePeerHead(sessionId, peerId)
+    const state = yield* sessionState(sessionId)
+    if (state[0]?.settledAt !== null && state[0]?.settledAt !== undefined) {
+      return { type: "Settled" as const }
+    }
     const history = decodeHistory(rows)
     const existing = history.find(matchesExisting)
     if (existing !== undefined) {
       return { type: "Appended" as const, item: existing as Commit }
     }
+    yield* ensurePeerHead(sessionId, peerId)
     if (!history.some(
       (item) => isBranchRecord(item) &&
         branchRecordId(item) === inReplyTo
@@ -919,13 +1055,16 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         w.created_at AS createdAt,
         w.updated_at AS updatedAt,
         w.peer_id AS peerId,
-        COUNT(s.session_id) AS sessionCount
+        COUNT(CASE WHEN s.settled_at IS NULL THEN s.session_id END) AS sessionCount
       FROM workstreams w
       LEFT JOIN sessions s ON s.workstream_id=w.workstream_id
       GROUP BY w.workstream_id
       ORDER BY w.updated_at DESC`.pipe(persist)
     }),
-    workstream: Effect.fn("Session.workstream")(function*(workstreamId) {
+    workstream: Effect.fn("Session.workstream")(function*(
+      workstreamId,
+      view: SessionListView = "active"
+    ) {
       const workstreams = yield* sql<{
         readonly workstreamId: string
         readonly name: string
@@ -939,7 +1078,7 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         w.created_at AS createdAt,
         w.updated_at AS updatedAt,
         w.peer_id AS peerId,
-        COUNT(s.session_id) AS sessionCount
+        COUNT(CASE WHEN s.settled_at IS NULL THEN s.session_id END) AS sessionCount
       FROM workstreams w
       LEFT JOIN sessions s ON s.workstream_id=w.workstream_id
       WHERE w.workstream_id=${workstreamId}
@@ -949,13 +1088,19 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         return yield* new WorkstreamNotFound({ workstreamId })
       }
       const sessions = yield* sessionSummaryRows(workstreamId).pipe(
-        Effect.map((rows) => rows.map((row) => ({
-          ...row,
-          title: row.title || "New session"
-        }))),
+        Effect.map((rows) => rows
+          .filter((row) => includeSession(row.settled, view))
+          .map((row) => ({
+            ...row,
+            title: row.title || "New session",
+            settled: row.settled !== 0
+          }))),
         persist
       )
-      return { workstream: summary, sessions }
+      return {
+        workstream: { ...summary, sessionCount: sessions.length },
+        sessions
+      }
     }),
     createSession: Effect.fn("Session.createSession")(function*(
       sessionId,
@@ -1005,11 +1150,31 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       }
       return result.item
     }),
+    settle: Effect.fn("Session.settle")(function*(sessionId) {
+      const result = yield* transitionSession(sessionId, "SessionSettled")
+      if (result.type === "NotFound") return yield* new NotFound({ sessionId })
+      if (result.type === "AlreadySettled") {
+        return yield* new AlreadySettled({ sessionId })
+      }
+      if (result.type === "Settled") return result.item
+      return yield* Effect.die(`Unexpected lifecycle result: ${result.type}`)
+    }),
+    reopen: Effect.fn("Session.reopen")(function*(sessionId) {
+      const result = yield* transitionSession(sessionId, "SessionReopened")
+      if (result.type === "NotFound") return yield* new NotFound({ sessionId })
+      if (result.type === "NotSettled") return yield* new NotSettled({ sessionId })
+      if (result.type === "Reopened") return result.item
+      return yield* Effect.die(`Unexpected lifecycle result: ${result.type}`)
+    }),
     appendUserCommit: Effect.fn("Session.appendUserCommit")(
       function*(sessionId, content, commitId, requestedPeerId = defaultPeerId) {
         const result = yield* Effect.gen(function*() {
           const rows = yield* sessionRows(sessionId)
           if (rows.length === 0) return { type: "NotFound" as const }
+          const state = yield* sessionState(sessionId)
+          if (state[0]?.settledAt !== null && state[0]?.settledAt !== undefined) {
+            return { type: "Settled" as const }
+          }
           yield* ensurePeerHead(sessionId, requestedPeerId)
           const heads = yield* sql<{ readonly commitId: string | null }>`
             SELECT commit_id AS commitId FROM peer_branch_heads
@@ -1031,6 +1196,9 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         if (result.type === "NotFound") {
           return yield* new NotFound({ sessionId })
         }
+        if (result.type === "Settled") {
+          return yield* new Settled({ sessionId })
+        }
         return result.item
       }
     ),
@@ -1048,7 +1216,10 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       const result = yield* Effect.gen(function*() {
         const rows = yield* sessionRows(sessionId)
         if (rows.length === 0) return { type: "NotFound" as const }
-        yield* ensurePeerHead(sessionId, requestedPeerId)
+        const state = yield* sessionState(sessionId)
+        if (state[0]?.settledAt !== null && state[0]?.settledAt !== undefined) {
+          return { type: "Settled" as const }
+        }
         const history = decodeHistory(rows)
         const existing = history.find(
           (item): item is Extract<Commit, { readonly type: "ToolCommit" }> =>
@@ -1067,6 +1238,7 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
             ? { type: "Appended" as const, item: existing }
             : { type: "ToolCommitConflict" as const }
         }
+        yield* ensurePeerHead(sessionId, requestedPeerId)
         if (!history.some(
           (item) => isBranchRecord(item) &&
             branchRecordId(item) === inReplyTo
@@ -1091,6 +1263,7 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         return { type: "Appended" as const, item: item as Extract<Commit, { type: "ToolCommit" }> }
       }).pipe(sql.withTransaction, persist)
       if (result.type === "NotFound") return yield* new NotFound({ sessionId })
+      if (result.type === "Settled") return yield* new Settled({ sessionId })
       if (result.type === "CommitNotFound") {
         return yield* new CommitNotFound({ sessionId, commitId: result.commitId })
       }
@@ -1114,6 +1287,9 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         )
         if (result.type === "NotFound") {
           return yield* new NotFound({ sessionId })
+        }
+        if (result.type === "Settled") {
+          return yield* new Settled({ sessionId })
         }
         if (result.type === "CommitNotFound") {
           return yield* new CommitNotFound({
@@ -1143,6 +1319,9 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         if (result.type === "NotFound") {
           return yield* new NotFound({ sessionId })
         }
+        if (result.type === "Settled") {
+          return yield* new Settled({ sessionId })
+        }
         if (result.type === "CommitNotFound") {
           return yield* new CommitNotFound({
             sessionId,
@@ -1162,6 +1341,10 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     ) {
       const rows = yield* sessionRows(sessionId).pipe(persist)
       if (rows.length === 0) return yield* new NotFound({ sessionId })
+      const state = yield* sessionState(sessionId).pipe(persist)
+      if (state[0]?.settledAt !== null && state[0]?.settledAt !== undefined) {
+        return yield* new Settled({ sessionId })
+      }
       const history = decodeHistory(rows)
       if (commitId !== null && !history.some(
         (item) => isCommit(item) && item.commitId === commitId
@@ -1185,17 +1368,25 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         SELECT commit_id AS branchHeadId
         FROM peer_branch_heads
         WHERE peer_id=${requestedPeerId} AND session_id=${sessionId}`.pipe(persist)
+      const states = yield* sessionState(sessionId).pipe(persist)
       return {
         items: decodeHistory(rows),
-        branchHeadId: heads[0]?.branchHeadId ?? null
+        branchHeadId: heads[0]?.branchHeadId ?? null,
+        settled: states[0]?.settledAt !== null && states[0]?.settledAt !== undefined
       }
     }),
-    listSessions: Effect.fn("Session.listSessions")(function*(workstreamId) {
+    listSessions: Effect.fn("Session.listSessions")(function*(
+      workstreamId,
+      view: SessionListView = "active"
+    ) {
       return yield* sessionSummaryRows(workstreamId).pipe(
-        Effect.map((rows) => rows.map((row) => ({
-          ...row,
-          title: row.title || "New session"
-        }))),
+        Effect.map((rows) => rows
+          .filter((row) => includeSession(row.settled, view))
+          .map((row) => ({
+            ...row,
+            title: row.title || "New session",
+            settled: row.settled !== 0
+          }))),
         persist
       )
     }),

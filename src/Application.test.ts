@@ -400,6 +400,57 @@ it.live(
 )
 
 it.live(
+  "rejects replayed Tool and Agent outcomes after a Session is settled",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-settlement-outcomes-")
+
+    const result = yield* Effect.gen(function*() {
+      const store = yield* Session.make(path)
+      yield* store.createSession("settlement-outcomes-session")
+      const user = yield* store.appendUserCommit(
+        "settlement-outcomes-session",
+        "Do the work",
+        "settlement-outcomes-user"
+      )
+      yield* store.appendToolCommit(
+        "settlement-outcomes-session",
+        "settlement-outcomes-call",
+        "Lookup",
+        { query: "same" },
+        { type: "Success", result: "done" },
+        user.commitId,
+        0
+      )
+      yield* store.appendAgentMessageCommit(
+        "settlement-outcomes-session",
+        "done",
+        user.commitId
+      )
+      yield* store.settle("settlement-outcomes-session")
+
+      const replayedTool = yield* Effect.flip(store.appendToolCommit(
+        "settlement-outcomes-session",
+        "settlement-outcomes-call",
+        "Lookup",
+        { query: "same" },
+        { type: "Success", result: "done" },
+        user.commitId,
+        0
+      ))
+      const replayedAgent = yield* Effect.flip(store.appendAgentMessageCommit(
+        "settlement-outcomes-session",
+        "done",
+        user.commitId
+      ))
+      return { replayedTool, replayedAgent }
+    }).pipe(Effect.provide(BunCrypto.layer))
+
+    expect(result.replayedTool).toBeInstanceOf(Session.Settled)
+    expect(result.replayedAgent).toBeInstanceOf(Session.Settled)
+  })
+)
+
+it.live(
   "two explicit Agent Runs from one Commit create independent descendants",
   () => Effect.gen(function*() {
     const { path } = yield* temporaryDatabase("corredor-independent-runs-")
@@ -545,6 +596,128 @@ it.live(
       expect.objectContaining({ type: "AgentMessageCommit", content: "First durable answer" }),
       expect.objectContaining({ type: "UserCommit", commitId: "runtime-second-user" }),
       expect.objectContaining({ type: "AgentMessageCommit", content: "Second durable answer" })
+    ])
+  })
+)
+
+it.live(
+  "settles a Session without losing history and reopens it for new work",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-settlement-")
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: () => Effect.succeed("durable answer")
+    }))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const session = yield* application.createSession("settlement-session")
+      const user = yield* application.submitUserCommit(
+        session.sessionId,
+        "Finish this work",
+        "settlement-user"
+      )
+      const settled = yield* application.settle(session.sessionId)
+      const settledHistory = yield* application.history(session.sessionId)
+      const activeSessions = yield* application.listSessions(undefined, "active")
+      const settledSessions = yield* application.listSessions(undefined, "settled")
+      const checkoutError = yield* Effect.flip(application.checkout(
+        session.sessionId,
+        user.commitId
+      ))
+      const commitError = yield* Effect.flip(application.submitUserCommit(
+        session.sessionId,
+        "This must wait",
+        "settlement-rejected"
+      ))
+      const runError = yield* Effect.flip(application.startAgentRun(
+        session.sessionId,
+        user.commitId,
+        Agent.defaultDefinition
+      ))
+      const reopened = yield* application.reopen(session.sessionId)
+      const reopenedHistory = yield* application.history(session.sessionId)
+      const activity = yield* application.activityAfter(session.position)
+      const continued = yield* application.submitUserCommit(
+        session.sessionId,
+        "Continue after reopening",
+        "settlement-continued"
+      )
+      return {
+        session,
+        user,
+        settled,
+        settledHistory,
+        activeSessions,
+        settledSessions,
+        checkoutError,
+        commitError,
+        runError,
+        reopened,
+        reopenedHistory,
+        activity,
+        continued
+      }
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    expect(result.settled.type).toBe("SessionSettled")
+    expect(result.reopened.type).toBe("SessionReopened")
+    expect(result.settledHistory.settled).toBe(true)
+    expect(result.settledHistory.items).toContainEqual(result.user)
+    expect(result.activeSessions).toEqual([])
+    expect(result.settledSessions).toEqual([
+      expect.objectContaining({
+        sessionId: result.session.sessionId,
+        settled: true
+      })
+    ])
+    expect(result.checkoutError).toBeInstanceOf(Session.Settled)
+    expect(result.commitError).toBeInstanceOf(Session.Settled)
+    expect(result.runError).toBeInstanceOf(Session.Settled)
+    expect(result.reopenedHistory.settled).toBe(false)
+    expect(result.activity.map((item) => item.type)).toEqual([
+      "UserCommit",
+      "SessionSettled",
+      "SessionReopened"
+    ])
+    expect(result.continued).toMatchObject({
+      type: "UserCommit",
+      commitId: "settlement-continued"
+    })
+  })
+)
+
+it.live(
+  "restores Settlement state and lifecycle history after the Peer restarts",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-settlement-restart-")
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: () => Effect.succeed("")
+    }))
+
+    const sessionId = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const session = yield* application.createSession("settlement-restart")
+      yield* application.settle(session.sessionId)
+      return session.sessionId
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    const restored = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      return {
+        history: yield* application.history(sessionId),
+        active: yield* application.listSessions(),
+        settled: yield* application.listSessions(undefined, "settled")
+      }
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    expect(restored.history.settled).toBe(true)
+    expect(restored.history.items.map((item) => item.type)).toEqual([
+      "SessionCreated",
+      "SessionSettled"
+    ])
+    expect(restored.active).toEqual([])
+    expect(restored.settled).toEqual([
+      expect.objectContaining({ sessionId, settled: true })
     ])
   })
 )

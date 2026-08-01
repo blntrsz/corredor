@@ -23,12 +23,19 @@ export interface Interface {
     ProxyError
   >
   readonly workstream: (
-    workstreamId: string
+    workstreamId: string,
+    view?: Session.SessionListView
   ) => Effect.Effect<Session.WorkstreamSnapshot, ProxyError>
   readonly createSession: (
     sessionId?: string,
     workstreamId?: string
   ) => Effect.Effect<Session.SessionCreated, ProxyError>
+  readonly settle: (
+    sessionId: string
+  ) => Effect.Effect<Session.SessionSettled, ProxyError>
+  readonly reopen: (
+    sessionId: string
+  ) => Effect.Effect<Session.SessionReopened, ProxyError>
   readonly submitUserCommit: (
     sessionId: string,
     content: string,
@@ -43,7 +50,10 @@ export interface Interface {
     definition: Agent.Definition,
     runId?: string
   ) => Effect.Effect<void, ProxyError>
-  readonly listSessions: (workstreamId?: string) => Effect.Effect<
+  readonly listSessions: (
+    workstreamId?: string,
+    view?: Session.SessionListView
+  ) => Effect.Effect<
     ReadonlyArray<Session.SessionSummary>,
     ProxyError
   >
@@ -81,6 +91,10 @@ const HistoryResponse = Schema.Struct({
   history: Session.HistorySnapshotSchema
 })
 const WorkstreamResponse = Session.WorkstreamSnapshotSchema
+const LifecycleResponse = Schema.Union([
+  Schema.Struct({ event: Session.SessionSettledSchema }),
+  Schema.Struct({ event: Session.SessionReopenedSchema })
+])
 
 const proxyError = (cause: unknown): ProxyError => new ProxyError({
   message: cause instanceof Error ? cause.message : String(cause)
@@ -192,9 +206,13 @@ export const make = (
         .pipe(Effect.mapError(proxyError))
       return decoded.workstreams as ReadonlyArray<Session.WorkstreamSummary>
     }),
-    workstream: Effect.fn("AgentProxy.workstream")(function*(workstreamId: string) {
+    workstream: Effect.fn("AgentProxy.workstream")(function*(
+      workstreamId: string,
+      view: Session.SessionListView = "active"
+    ) {
+      const query = view === "active" ? "" : `?state=${view}`
       const body = yield* responseJson(HttpClientRequest.get(
-        url(`/v1/workstreams/${encodeURIComponent(workstreamId)}`)
+        url(`/v1/workstreams/${encodeURIComponent(workstreamId)}${query}`)
       ))
       const decoded = yield* Schema.decodeUnknownEffect(WorkstreamResponse)(body)
         .pipe(Effect.mapError(proxyError))
@@ -218,6 +236,22 @@ export const make = (
         return decoded.session as Session.SessionCreated
       }
     ),
+    settle: Effect.fn("AgentProxy.settle")(function*(sessionId: string) {
+      const body = yield* responseJson(withPeer(HttpClientRequest.post(
+        url(`/v1/sessions/${encodeURIComponent(sessionId)}/settle`)
+      )))
+      const decoded = yield* Schema.decodeUnknownEffect(LifecycleResponse)(body)
+        .pipe(Effect.mapError(proxyError))
+      return decoded.event as Session.SessionSettled
+    }),
+    reopen: Effect.fn("AgentProxy.reopen")(function*(sessionId: string) {
+      const body = yield* responseJson(withPeer(HttpClientRequest.post(
+        url(`/v1/sessions/${encodeURIComponent(sessionId)}/reopen`)
+      )))
+      const decoded = yield* Schema.decodeUnknownEffect(LifecycleResponse)(body)
+        .pipe(Effect.mapError(proxyError))
+      return decoded.event as Session.SessionReopened
+    }),
     submitUserCommit: Effect.fn("AgentProxy.submitUserCommit")(
       function*(sessionId: string, content: string, commitId: string) {
         const body = yield* responseJson(withPeer(HttpClientRequest.post(
@@ -247,10 +281,15 @@ export const make = (
         }))))
       }
     ),
-    listSessions: Effect.fn("AgentProxy.listSessions")(function*(workstreamId?: string) {
-      const query = workstreamId === undefined
-        ? ""
-        : `?workstreamId=${encodeURIComponent(workstreamId)}`
+    listSessions: Effect.fn("AgentProxy.listSessions")(function*(
+      workstreamId?: string,
+      view: Session.SessionListView = "active"
+    ) {
+      const params = new URLSearchParams()
+      if (workstreamId !== undefined) params.set("workstreamId", workstreamId)
+      if (view !== "active") params.set("state", view)
+      const encodedQuery = params.toString()
+      const query = encodedQuery.length === 0 ? "" : `?${encodedQuery}`
       const body = yield* responseJson(
         HttpClientRequest.get(url(`/v1/sessions${query}`))
       )
