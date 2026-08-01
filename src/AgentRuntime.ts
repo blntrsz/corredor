@@ -13,6 +13,17 @@ export interface Interface {
     runId?: string,
     peerId?: string
   ) => Effect.Effect<void, Session.Error | Session.PersistenceError>
+  /** Summarizes the selected Branch into one durable Compaction Commit. */
+  readonly compact: (
+    sessionId: string,
+    startingCommitId: string,
+    definition?: Agent.Definition,
+    runId?: string,
+    peerId?: string
+  ) => Effect.Effect<
+    Extract<Session.Commit, { readonly type: "CompactionCommit" }>,
+    Session.Error | Session.PersistenceError
+  >
   /** Requests an active Agent Run to stop and records its durable outcome. */
   readonly interrupt: (
     sessionId: string,
@@ -31,6 +42,11 @@ export class Service extends Context.Service<Service, Interface>()(
 
 const defaultFailureReason = "Agent run failed"
 const defaultInterruptReason = "Interrupted by user"
+const compactionInstruction = [
+  "Produce a concise durable summary of the complete active ancestry supplied in context.",
+  "Preserve the facts, decisions, unfinished work, and user intent needed by a later Agent Run.",
+  "Return only the summary text; do not describe this instruction."
+].join(" ")
 
 const visibleInterruptReason = (reason?: string): string => {
   const normalized = reason?.trim() ?? ""
@@ -78,7 +94,14 @@ const agentContext = (
   headId: string
 ): ReadonlyArray<Agent.ContextEntry> => {
   const context: Array<Agent.ContextEntry> = []
-  for (const record of Session.branchHistory(history, headId)) {
+  const branch = Session.branchHistory(history, headId)
+  const latestCompaction = branch.findLastIndex(
+    (record) => record.type === "CompactionCommit"
+  )
+  const activeBranch = latestCompaction < 0
+    ? branch
+    : branch.slice(latestCompaction)
+  for (const record of activeBranch) {
     context.push(Session.foldBranchRecord<Agent.ContextEntry>(record, {
       user: (entry) => ({
         type: "User" as const,
@@ -87,6 +110,11 @@ const agentContext = (
       }),
       agentMessage: (entry) => ({
         type: "AgentMessage" as const,
+        commitId: entry.commitId,
+        content: entry.content
+      }),
+      compaction: (entry) => ({
+        type: "Compaction" as const,
         commitId: entry.commitId,
         content: entry.content
       }),
@@ -180,6 +208,7 @@ export const make = Effect.gen(function*() {
     }
     const existingOutcome = snapshot.items.find((candidate) =>
       (candidate.type === "AgentMessageCommit" ||
+        candidate.type === "CompactionCommit" ||
         candidate.type === "FailureCommit" ||
         candidate.type === "InterruptCommit") &&
       candidate.inReplyTo === startingCommitId &&
@@ -315,6 +344,80 @@ export const make = Effect.gen(function*() {
     )
   })
 
+  const compact: Interface["compact"] = Effect.fn("AgentRuntime.compact")(
+    function*(
+      sessionId: string,
+      startingCommitId: string,
+      definition = Agent.defaultDefinition,
+      requestedRunId?: string,
+      requestedPeerId = Session.defaultPeerId
+    ) {
+      const snapshot = yield* store.history(sessionId)
+      if (snapshot.settled) {
+        return yield* new Session.Settled({ sessionId })
+      }
+      const startingCommit = snapshot.items.find(
+        (item): item is Session.Commit =>
+          Session.isCommit(item) && item.commitId === startingCommitId
+      )
+      if (startingCommit === undefined) {
+        return yield* new Session.CommitNotFound({
+          sessionId,
+          commitId: startingCommitId
+        })
+      }
+
+      const existingOutcome = snapshot.items.find((candidate) =>
+        (candidate.type === "AgentMessageCommit" ||
+          candidate.type === "CompactionCommit" ||
+          candidate.type === "FailureCommit" ||
+          candidate.type === "InterruptCommit") &&
+        candidate.inReplyTo === startingCommitId &&
+        candidate.runId === requestedRunId
+      )
+      if (existingOutcome?.type === "CompactionCommit") return existingOutcome
+      if (existingOutcome !== undefined) {
+        return yield* new Session.PersistenceError({
+          message: `Agent Run already has a terminal outcome for ${startingCommitId}`
+        })
+      }
+
+      const compactionDefinition: Agent.Definition = {
+        ...definition,
+        instructions: `${definition.instructions}\n\n${compactionInstruction}`,
+        tools: []
+      }
+      const summary = yield* Effect.matchCauseEffect(
+        agent.run(
+          agentContext(snapshot.items, startingCommitId),
+          () => Effect.void,
+          compactionDefinition
+        ),
+        {
+          onFailure: (cause) => Effect.gen(function*() {
+            const reason = safeFailureReason(cause)
+            yield* store.appendFailureCommit(
+              sessionId,
+              reason,
+              startingCommitId,
+              requestedRunId,
+              requestedPeerId
+            )
+            return yield* new Session.PersistenceError({ message: reason })
+          }),
+          onSuccess: (response) => Effect.succeed(response)
+        }
+      )
+      return yield* store.appendCompactionCommit(
+        sessionId,
+        summary,
+        startingCommitId,
+        requestedRunId,
+        requestedPeerId
+      )
+    }
+  )
+
   const interrupt = Effect.fn("AgentRuntime.interrupt")(function*(
     sessionId: string,
     startingCommitId: string,
@@ -393,7 +496,7 @@ export const make = Effect.gen(function*() {
     Effect.forkScoped
   )
 
-  return Service.of({ start, interrupt })
+  return Service.of({ start, compact, interrupt })
 })
 
 export const layerWithoutDependencies = Layer.effect(Service, make)

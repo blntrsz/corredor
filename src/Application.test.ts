@@ -992,3 +992,162 @@ it.live(
     ])
   })
 )
+
+it.live(
+  "compacts a complete Branch while preserving provenance and replacing later context",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-compaction-")
+    const contexts: Array<ReadonlyArray<Agent.ContextEntry>> = []
+    const definitions: Array<Agent.Definition> = []
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (context, _onEvent, definition) => Effect.sync(() => {
+        contexts.push(context)
+        definitions.push(definition ?? Agent.defaultDefinition)
+        return definitions.at(-1)?.id === "compactor"
+          ? "A compact summary"
+          : `response-${contexts.length}`
+      })
+    }))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const session = yield* application.createSession("compaction-session")
+      yield* application.submitUserCommit(
+        session.sessionId,
+        "Remember the durable answer",
+        "compaction-user"
+      )
+
+      let beforeCompaction = yield* application.history(session.sessionId)
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (beforeCompaction.items.some(
+          (item) => item.type === "AgentMessageCommit"
+        )) break
+        yield* Effect.sleep("10 millis")
+        beforeCompaction = yield* application.history(session.sessionId)
+      }
+      const sourceHeadId = beforeCompaction.branchHeadId
+      if (sourceHeadId === null) {
+        return yield* Effect.die("timed out waiting for the source Branch Head")
+      }
+
+      const compaction = yield* application.compact(
+        session.sessionId,
+        sourceHeadId,
+        {
+          id: "compactor",
+          instructions: "Summarize the complete active ancestry.",
+          tools: []
+        },
+        "compaction-run"
+      )
+      const compacted = yield* application.history(session.sessionId)
+      yield* application.submitUserCommit(
+        session.sessionId,
+        "Continue from the summary",
+        "post-compaction-user"
+      )
+
+      let afterFollowUp = compacted
+      for (let attempt = 0; attempt < 100; attempt++) {
+        afterFollowUp = yield* application.history(session.sessionId)
+        if (afterFollowUp.items.some(
+          (item) => item.type === "AgentMessageCommit" &&
+            item.inReplyTo === "post-compaction-user"
+        )) break
+        yield* Effect.sleep("10 millis")
+      }
+      return { beforeCompaction, compacted, afterFollowUp, compaction }
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    expect(result.compaction).toMatchObject({
+      type: "CompactionCommit",
+      parentId: result.beforeCompaction.branchHeadId,
+      inReplyTo: result.beforeCompaction.branchHeadId,
+      runId: "compaction-run",
+      content: "A compact summary"
+    })
+    expect(result.compacted.branchHeadId).toBe(result.compaction.commitId)
+    expect(result.compacted.items.map((item) => item.type)).toEqual([
+      "SessionCreated",
+      "UserCommit",
+      "AgentMessageCommit",
+      "CompactionCommit"
+    ])
+    expect(result.afterFollowUp.items.map((item) => item.type)).toEqual([
+      "SessionCreated",
+      "UserCommit",
+      "AgentMessageCommit",
+      "CompactionCommit",
+      "UserCommit",
+      "AgentMessageCommit"
+    ])
+    expect(contexts.map((context) => context.map((entry) => entry.type))).toEqual([
+      ["User"],
+      ["User", "AgentMessage"],
+      ["Compaction", "User"]
+    ])
+    expect(definitions.map((definition) => definition.id)).toEqual([
+      "default",
+      "compactor",
+      "default"
+    ])
+  })
+)
+
+it.live(
+  "records a durable Failure Commit when compaction fails",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-compaction-failure-")
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (_context, _onEvent, definition) => definition?.id === "failing-compactor"
+        ? Effect.die(new Error("compaction crashed\nhidden detail"))
+        : Effect.succeed("durable source answer")
+    }))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const session = yield* application.createSession("compaction-failure-session")
+      yield* application.submitUserCommit(
+        session.sessionId,
+        "Build a summary",
+        "compaction-failure-user"
+      )
+
+      let beforeCompaction = yield* application.history(session.sessionId)
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (beforeCompaction.items.some(
+          (item) => item.type === "AgentMessageCommit"
+        )) break
+        yield* Effect.sleep("10 millis")
+        beforeCompaction = yield* application.history(session.sessionId)
+      }
+      const sourceHeadId = beforeCompaction.branchHeadId
+      if (sourceHeadId === null) {
+        return yield* Effect.die("timed out waiting for the source Branch Head")
+      }
+      const error = yield* Effect.flip(application.compact(
+        session.sessionId,
+        sourceHeadId,
+        {
+          id: "failing-compactor",
+          instructions: "Summarize the Branch.",
+          tools: []
+        },
+        "failing-compaction-run"
+      ))
+      return { error, history: yield* application.history(session.sessionId) }
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    expect(result.error).toMatchObject({ message: "compaction crashed" })
+    expect(result.error.message).not.toContain("hidden detail")
+    expect(result.history.items).toContainEqual(expect.objectContaining({
+      type: "FailureCommit",
+      inReplyTo: result.history.items.find(
+        (item) => item.type === "AgentMessageCommit"
+      )?.commitId,
+      runId: "failing-compaction-run",
+      reason: "compaction crashed"
+    }))
+  })
+)

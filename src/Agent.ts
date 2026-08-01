@@ -149,6 +149,11 @@ export namespace Agent {
       readonly content: string
     }
     | {
+      readonly type: "Compaction"
+      readonly commitId: string
+      readonly content: string
+    }
+    | {
       readonly type: "Tool"
       readonly commitId: string
       readonly name: string
@@ -213,6 +218,12 @@ export namespace Agent {
           if (entry.type === "AgentMessage") {
             return { role: "assistant" as const, content: entry.content }
           }
+          if (entry.type === "Compaction") {
+            return {
+              role: "assistant" as const,
+              content: `[Compacted context]\n${entry.content}`
+            }
+          }
           if (entry.type === "Failure") {
             return {
               role: "assistant" as const,
@@ -246,10 +257,14 @@ export namespace Agent {
         for (let turn = 0; turn < maxTurns; turn++) {
           let responseText = ""
           let hasToolCall = false
-          const stream = chat.streamText({
-            prompt: turn === 0 ? prompt : [],
-            toolkit
-          })
+          const stream = definition.tools.length > 0
+            ? chat.streamText({
+              prompt: turn === 0 ? prompt : [],
+              toolkit
+            })
+            : chat.streamText({
+              prompt: turn === 0 ? prompt : []
+            })
           yield* Stream.runForEach(stream, (part) => {
             if (part.type === "text-delta") {
               responseText += part.delta

@@ -233,6 +233,40 @@ const startAgentRun = Effect.gen(function*() {
   Effect.catchCause(() => Effect.succeed(internalServerError()))
 )
 
+const compactSession = Effect.gen(function*() {
+  const application = yield* Application.Service
+  const params = yield* HttpRouter.params
+  const request = yield* HttpServerRequest.HttpServerRequest
+  const body = yield* Schema.decodeUnknownEffect(Schema.Struct({
+    commitId: Schema.optional(Schema.String),
+    startingCommitId: Schema.optional(Schema.String),
+    agent: Schema.optional(Agent.DefinitionSchema),
+    runId: Schema.optional(Schema.String)
+  }))(yield* request.json)
+  const sessionId = params.sessionId
+  if (sessionId === undefined) return missingSessionId()
+  const startingCommitId = body.commitId ?? body.startingCommitId
+  if (startingCommitId === undefined) {
+    return HttpServerResponse.jsonUnsafe(
+      { error: "missing starting commit id" },
+      { status: 400 }
+    )
+  }
+  const commit = yield* application.compact(
+    sessionId,
+    startingCommitId,
+    body.agent,
+    body.runId,
+    peerIdFrom(request)
+  )
+  return HttpServerResponse.jsonUnsafe({ commit }, { status: 201 })
+}).pipe(
+  Effect.catchTag("@corredor/Session/NotFound", sessionNotFound),
+  Effect.catchTag("@corredor/Session/Settled", sessionSettled),
+  Effect.catchTag("@corredor/Session/CommitNotFound", commitNotFound),
+  Effect.catchCause(() => Effect.succeed(internalServerError()))
+)
+
 const interruptAgentRun = Effect.gen(function*() {
   const application = yield* Application.Service
   const params = yield* HttpRouter.params
@@ -423,6 +457,11 @@ const routes = Layer.mergeAll(
     "POST",
     "/v1/sessions/:sessionId/runs",
     startAgentRun
+  ),
+  HttpRouter.add(
+    "POST",
+    "/v1/sessions/:sessionId/compact",
+    compactSession
   ),
   HttpRouter.add(
     "POST",
