@@ -19,7 +19,11 @@ import {
 import { Crypto, Effect, Stream } from "effect"
 import * as AgentProxy from "./AgentProxy.ts"
 import * as Session from "./Session.ts"
-import type { HistoryItem, SessionSummary } from "./Session.ts"
+import type {
+  HistoryItem,
+  SessionSummary,
+  WorkstreamSummary
+} from "./Session.ts"
 
 const ansi = (open: string, close: string) =>
   (text: string): string => `${open}${text}${close}`
@@ -127,6 +131,77 @@ class SessionPicker implements Component, Focusable {
       lines.push(truncateToWidth(dim(`      ${new Date(session.updatedAt).toLocaleString()} · ${session.userCommitCount} User Commits${id}`), width))
     }
     lines.push("", dim("  ↑↓ navigate · enter resume · type search · ctrl+s sort · ctrl+p IDs · esc cancel"), "")
+    return lines.map((line) => truncateToWidth(line, width))
+  }
+
+  invalidate(): void {}
+}
+
+class WorkstreamPicker implements Component, Focusable {
+  focused = false
+  private query = ""
+  private selected = 0
+
+  constructor(
+    private readonly workstreams: ReadonlyArray<WorkstreamSummary>,
+    private readonly onSelect: (workstreamId: string) => void,
+    private readonly onCancel: () => void,
+    private readonly requestRender: () => void
+  ) {}
+
+  private filtered(): ReadonlyArray<WorkstreamSummary> {
+    const query = this.query.toLowerCase()
+    return this.workstreams.filter((workstream) =>
+      workstream.name.toLowerCase().includes(query) ||
+      workstream.workstreamId.toLowerCase().includes(query)
+    )
+  }
+
+  handleInput(data: string): void {
+    const workstreams = this.filtered()
+    if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+      return this.onCancel()
+    }
+    if (matchesKey(data, Key.up)) this.selected = Math.max(0, this.selected - 1)
+    else if (matchesKey(data, Key.down)) {
+      this.selected = Math.min(workstreams.length - 1, this.selected + 1)
+    } else if (matchesKey(data, Key.enter)) {
+      const workstream = workstreams[this.selected]
+      if (workstream !== undefined) this.onSelect(workstream.workstreamId)
+      return
+    } else if (matchesKey(data, Key.backspace)) {
+      this.query = this.query.slice(0, -1)
+      this.selected = 0
+    } else if (data.length === 1 && data >= " ") {
+      this.query += data
+      this.selected = 0
+    }
+    this.requestRender()
+  }
+
+  render(width: number): string[] {
+    const workstreams = this.filtered()
+    const lines = [
+      "",
+      bold(cyan("  Choose Workstream")),
+      dim(`  Search: ${this.query || "type to filter…"}`),
+      dim(`  ${workstreams.length} Workstreams`),
+      ""
+    ]
+    if (workstreams.length === 0) lines.push(yellow("  No matching Workstreams"))
+    for (const [index, workstream] of workstreams.entries()) {
+      const selected = index === this.selected
+      const prefix = selected ? cyan("› ") : "  "
+      lines.push(truncateToWidth(
+        `  ${prefix}${selected ? bold(workstream.name) : workstream.name}`,
+        width
+      ))
+      lines.push(truncateToWidth(
+        dim(`      ${workstream.sessionCount} Sessions · ${workstream.workstreamId}`),
+        width
+      ))
+    }
+    lines.push("", dim("  ↑↓ navigate · enter open · type search · esc cancel"), "")
     return lines.map((line) => truncateToWidth(line, width))
   }
 
@@ -523,16 +598,40 @@ const make = (
   }
 
   const resumeSession = () => {
-    void Effect.runPromise(proxy.listSessions()).then((sessions) => {
-      const previous = sessions.filter((session) => session.sessionId !== sessionId)
-      if (previous.length === 0) {
-        addErrorMessage("No previous sessions found.")
+    void Effect.runPromise(proxy.listWorkstreams()).then((workstreams) => {
+      if (workstreams.length === 0) {
+        addErrorMessage("No Workstreams found.")
         tui.requestRender()
         return
       }
-      const picker = new SessionPicker(
-        previous,
-        (selectedSessionId) => switchSession(selectedSessionId),
+      const openSessions = (workstreamId: string) => {
+        void Effect.runPromise(proxy.workstream(workstreamId)).then((snapshot) => {
+          const previous = snapshot.sessions.filter(
+            (session) => session.sessionId !== sessionId
+          )
+          if (previous.length === 0) {
+            showConversation()
+            addErrorMessage("No previous Sessions found in this Workstream.")
+            return
+          }
+          const picker = new SessionPicker(
+            previous,
+            (selectedSessionId) => switchSession(selectedSessionId),
+            showConversation,
+            () => tui.requestRender()
+          )
+          app.clear()
+          app.addChild(picker)
+          tui.setFocus(picker)
+          tui.requestRender()
+        }).catch((error: unknown) => {
+          showConversation()
+          addErrorMessage(formatError(error))
+        })
+      }
+      const picker = new WorkstreamPicker(
+        workstreams,
+        openSessions,
         showConversation,
         () => tui.requestRender()
       )

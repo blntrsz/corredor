@@ -9,8 +9,22 @@ import * as Session from "./Session.ts"
  * adapters. Callers express domain actions without accessing persistence.
  */
 export interface Interface {
+  readonly createWorkstream: (
+    workstreamId?: string,
+    name?: string,
+    peerId?: string
+  ) => Effect.Effect<Session.Workstream, Session.Error>
+  readonly listWorkstreams: () => Effect.Effect<
+    ReadonlyArray<Session.WorkstreamSummary>,
+    Session.PersistenceError
+  >
+  readonly workstream: (
+    workstreamId: string
+  ) => Effect.Effect<Session.WorkstreamSnapshot, Session.PersistenceError | Session.WorkstreamNotFound>
   readonly createSession: (
-    sessionId?: string
+    sessionId?: string,
+    workstreamId?: string,
+    peerId?: string
   ) => Effect.Effect<Session.SessionCreated, Session.Error>
   readonly submitUserCommit: (
     sessionId: string,
@@ -33,7 +47,7 @@ export interface Interface {
     commitId: string | null,
     peerId?: string
   ) => Effect.Effect<void, Session.Error>
-  readonly listSessions: () => Effect.Effect<
+  readonly listSessions: (workstreamId?: string) => Effect.Effect<
     ReadonlyArray<Session.SessionSummary>,
     Session.PersistenceError
   >
@@ -62,9 +76,28 @@ export const make = Effect.gen(function*() {
   )
 
   return Service.of({
+    createWorkstream: Effect.fn("Application.createWorkstream")(
+      function*(requestedId?: string, name?: string, peerId?: string) {
+        return yield* store.createWorkstream(
+          requestedId ?? (yield* randomId),
+          name,
+          peerId
+        )
+      }
+    ),
+    listWorkstreams: Effect.fn("Application.listWorkstreams")(function*() {
+      return yield* store.listWorkstreams()
+    }),
+    workstream: Effect.fn("Application.workstream")(function*(workstreamId) {
+      return yield* store.workstream(workstreamId)
+    }),
     createSession: Effect.fn("Application.createSession")(
-      function*(requestedId?: string) {
-        return yield* store.createSession(requestedId ?? (yield* randomId))
+      function*(requestedId?: string, workstreamId?: string, peerId?: string) {
+        return yield* store.createSession(
+          requestedId ?? (yield* randomId),
+          workstreamId,
+          peerId
+        )
       }
     ),
     submitUserCommit: Effect.fn("Application.submitUserCommit")(
@@ -104,8 +137,8 @@ export const make = Effect.gen(function*() {
         yield* store.checkout(sessionId, commitId, peerId)
       }
     ),
-    listSessions: Effect.fn("Application.listSessions")(function*() {
-      return yield* store.listSessions()
+    listSessions: Effect.fn("Application.listSessions")(function*(workstreamId?: string) {
+      return yield* store.listSessions(workstreamId)
     }),
     history: Effect.fn("Application.history")(function*(
       sessionId: string,

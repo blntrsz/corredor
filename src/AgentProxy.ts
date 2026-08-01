@@ -14,8 +14,20 @@ export class ProxyError extends Schema.TaggedErrorClass<ProxyError>()(
 ) {}
 
 export interface Interface {
+  readonly createWorkstream: (
+    workstreamId?: string,
+    name?: string
+  ) => Effect.Effect<Session.Workstream, ProxyError>
+  readonly listWorkstreams: () => Effect.Effect<
+    ReadonlyArray<Session.WorkstreamSummary>,
+    ProxyError
+  >
+  readonly workstream: (
+    workstreamId: string
+  ) => Effect.Effect<Session.WorkstreamSnapshot, ProxyError>
   readonly createSession: (
-    sessionId?: string
+    sessionId?: string,
+    workstreamId?: string
   ) => Effect.Effect<Session.SessionCreated, ProxyError>
   readonly submitUserCommit: (
     sessionId: string,
@@ -31,7 +43,7 @@ export interface Interface {
     definition: Agent.Definition,
     runId?: string
   ) => Effect.Effect<void, ProxyError>
-  readonly listSessions: () => Effect.Effect<
+  readonly listSessions: (workstreamId?: string) => Effect.Effect<
     ReadonlyArray<Session.SessionSummary>,
     ProxyError
   >
@@ -55,13 +67,20 @@ export class Service extends Context.Service<Service, Interface>()(
 const CreateSessionResponse = Schema.Struct({
   session: Session.SessionCreatedSchema
 })
+const CreateWorkstreamResponse = Schema.Struct({
+  workstream: Session.WorkstreamSchema
+})
 const CommitResponse = Schema.Struct({ commit: Session.CommitSchema })
 const SessionsResponse = Schema.Struct({
   sessions: Schema.Array(Session.SessionSummarySchema)
 })
+const WorkstreamsResponse = Schema.Struct({
+  workstreams: Schema.Array(Session.WorkstreamSummarySchema)
+})
 const HistoryResponse = Schema.Struct({
   history: Session.HistorySnapshotSchema
 })
+const WorkstreamResponse = Session.WorkstreamSnapshotSchema
 
 const proxyError = (cause: unknown): ProxyError => new ProxyError({
   message: cause instanceof Error ? cause.message : String(cause)
@@ -150,12 +169,46 @@ export const make = (
   )
 
   return Service.of({
+    createWorkstream: Effect.fn("AgentProxy.createWorkstream")(
+      function*(workstreamId?: string, name?: string) {
+        const body = yield* responseJson(
+          withPeer(HttpClientRequest.post(url("/v1/workstreams"))).pipe(
+            HttpClientRequest.bodyJsonUnsafe({
+              ...(workstreamId === undefined ? {} : { workstreamId }),
+              ...(name === undefined ? {} : { name })
+            })
+          )
+        )
+        const decoded = yield* Schema.decodeUnknownEffect(CreateWorkstreamResponse)(body)
+          .pipe(Effect.mapError(proxyError))
+        return decoded.workstream as Session.Workstream
+      }
+    ),
+    listWorkstreams: Effect.fn("AgentProxy.listWorkstreams")(function*() {
+      const body = yield* responseJson(
+        HttpClientRequest.get(url("/v1/workstreams"))
+      )
+      const decoded = yield* Schema.decodeUnknownEffect(WorkstreamsResponse)(body)
+        .pipe(Effect.mapError(proxyError))
+      return decoded.workstreams as ReadonlyArray<Session.WorkstreamSummary>
+    }),
+    workstream: Effect.fn("AgentProxy.workstream")(function*(workstreamId: string) {
+      const body = yield* responseJson(HttpClientRequest.get(
+        url(`/v1/workstreams/${encodeURIComponent(workstreamId)}`)
+      ))
+      const decoded = yield* Schema.decodeUnknownEffect(WorkstreamResponse)(body)
+        .pipe(Effect.mapError(proxyError))
+      return decoded as Session.WorkstreamSnapshot
+    }),
     createSession: Effect.fn("AgentProxy.createSession")(
-      function*(sessionId?: string) {
+      function*(sessionId?: string, workstreamId?: string) {
         const body = yield* responseJson(
           withPeer(HttpClientRequest.post(url("/v1/sessions"))).pipe(
             HttpClientRequest.bodyJsonUnsafe(
-              sessionId === undefined ? {} : { sessionId }
+              {
+                ...(sessionId === undefined ? {} : { sessionId }),
+                ...(workstreamId === undefined ? {} : { workstreamId })
+              }
             )
           )
         )
@@ -194,9 +247,12 @@ export const make = (
         }))))
       }
     ),
-    listSessions: Effect.fn("AgentProxy.listSessions")(function*() {
+    listSessions: Effect.fn("AgentProxy.listSessions")(function*(workstreamId?: string) {
+      const query = workstreamId === undefined
+        ? ""
+        : `?workstreamId=${encodeURIComponent(workstreamId)}`
       const body = yield* responseJson(
-        HttpClientRequest.get(url("/v1/sessions"))
+        HttpClientRequest.get(url(`/v1/sessions${query}`))
       )
       const decoded = yield* Schema.decodeUnknownEffect(SessionsResponse)(body)
         .pipe(Effect.mapError(proxyError))

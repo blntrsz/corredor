@@ -78,7 +78,9 @@ it.live("legacy user, agent, tool-call-only, and navigation history remains read
         "continue",
         "user-new"
       )
-      return { history, continued }
+      const workstreams = yield* store.listWorkstreams()
+      const workstream = yield* store.workstream(Session.defaultWorkstreamId)
+      return { history, continued, workstreams, workstream }
     }).pipe(Effect.provide(BunCrypto.layer))
     const migrated = yield* Effect.acquireRelease(
       Effect.sync(() => new Database(path, { readonly: true })),
@@ -111,6 +113,19 @@ it.live("legacy user, agent, tool-call-only, and navigation history remains read
       legacyMessageId: "message-2"
     })
     expect(result.continued.parentId).toBe("user-legacy")
+    expect(result.workstreams).toEqual([
+      expect.objectContaining({
+        workstreamId: Session.defaultWorkstreamId,
+        name: Session.defaultWorkstreamName,
+        sessionCount: 1
+      })
+    ])
+    expect(result.workstream.sessions).toEqual([
+      expect.objectContaining({
+        sessionId: "legacy-session",
+        workstreamId: Session.defaultWorkstreamId
+      })
+    ])
     expect(rawTypes.map((row) => row.type)).toEqual([
       "SessionCreated",
       "UserMessageAdded",
