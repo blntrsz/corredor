@@ -28,6 +28,7 @@ export type Commit =
   | CommitMetadata & {
     readonly type: "UserCommit"
     readonly content: string
+    readonly peerId?: string
     readonly legacyMessageId?: string
   }
   | CommitMetadata & {
@@ -121,6 +122,9 @@ export interface HistorySnapshot {
   readonly branchHeadId: string | null
 }
 
+/** Used when callers have not configured an explicit Peer identity. */
+export const defaultPeerId = "default-peer"
+
 const historyMetadata = {
   sessionId: Schema.String,
   sequence: Schema.Number,
@@ -149,6 +153,7 @@ const UserCommitSchema = Schema.Struct({
   ...commitMetadata,
   type: Schema.Literal("UserCommit"),
   content: Schema.String,
+  peerId: Schema.optional(Schema.String),
   legacyMessageId: Schema.optional(Schema.String)
 })
 
@@ -303,20 +308,17 @@ export interface CommitGraph {
   readonly headId: string | null
 }
 
-/**
- * Projects canonical Commits and compatible legacy context records into the
- * Session graph. Legacy navigation is read only as migration input.
- */
-export const commitGraph = (
+const projectCommitGraph = (
   history: ReadonlyArray<HistoryItem>,
-  requestedHeadId?: string | null
+  requestedHeadId?: string | null,
+  useLegacyNavigation = false
 ): CommitGraph => {
   const nodes: Array<CommitNode> = []
   const ids = new Set<string>()
   let headId: string | null = null
 
   for (const item of history) {
-    if (item.type === "LegacyNavigation") {
+    if (useLegacyNavigation && item.type === "LegacyNavigation") {
       headId = item.targetId === null || ids.has(item.targetId)
         ? item.targetId
         : headId
@@ -338,6 +340,17 @@ export const commitGraph = (
   }
   return { nodes, headId }
 }
+
+/** Projects the current canonical graph; legacy navigation is not authority. */
+export const commitGraph = (
+  history: ReadonlyArray<HistoryItem>,
+  requestedHeadId?: string | null
+): CommitGraph => projectCommitGraph(history, requestedHeadId)
+
+/** Used only once while initializing a local Branch Head during migration. */
+export const legacyBranchHead = (
+  history: ReadonlyArray<HistoryItem>
+): string | null => projectCommitGraph(history, undefined, true).headId
 
 /** Returns the root-to-head context records for a Branch. */
 export const branchHistory = (
@@ -370,7 +383,8 @@ export interface Interface {
   readonly appendUserCommit: (
     sessionId: string,
     content: string,
-    commitId: string
+    commitId: string,
+    peerId?: string
   ) => Effect.Effect<Extract<Commit, { readonly type: "UserCommit" }>, Error>
   readonly appendToolCommit: (
     sessionId: string,
@@ -380,22 +394,32 @@ export interface Interface {
     outcome: ToolOutcome,
     inReplyTo: string,
     index: number,
-    runId?: string
+    runId?: string,
+    peerId?: string
   ) => Effect.Effect<Extract<Commit, { readonly type: "ToolCommit" }>, Error>
   readonly appendAgentMessageCommit: (
     sessionId: string,
     content: string,
     inReplyTo: string,
-    runId?: string
+    runId?: string,
+    peerId?: string
   ) => Effect.Effect<Extract<Commit, { readonly type: "AgentMessageCommit" }>, Error>
   readonly appendFailureCommit: (
     sessionId: string,
     reason: string,
     inReplyTo: string,
-    runId?: string
+    runId?: string,
+    peerId?: string
   ) => Effect.Effect<Extract<Commit, { readonly type: "FailureCommit" }>, Error>
-  readonly checkout: (sessionId: string, commitId: string | null) => Effect.Effect<void, Error>
-  readonly history: (sessionId: string) => Effect.Effect<HistorySnapshot, PersistenceError>
+  readonly checkout: (
+    sessionId: string,
+    commitId: string | null,
+    peerId?: string
+  ) => Effect.Effect<void, Error>
+  readonly history: (
+    sessionId: string,
+    peerId?: string
+  ) => Effect.Effect<HistorySnapshot, PersistenceError>
   readonly listSessions: () => Effect.Effect<ReadonlyArray<SessionSummary>, PersistenceError>
   readonly activityAfter: (position: number, limit?: number) => Effect.Effect<ReadonlyArray<HistoryItem>, PersistenceError>
   readonly checkpoint: (consumer: string) => Effect.Effect<number, PersistenceError>
@@ -479,6 +503,7 @@ const decodeHistory = (rows: ReadonlyArray<EventRow>): ReadonlyArray<HistoryItem
         parentId,
         createdAt,
         content: String(payload.content ?? ""),
+        ...(typeof payload.peerId === "string" ? { peerId: payload.peerId } : {}),
         ...(row.event_type === "UserMessageAdded" &&
           typeof payload.messageId === "string"
           ? { legacyMessageId: payload.messageId }
@@ -589,14 +614,15 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
   const sessionRows = (sessionId: string) =>
     sql<EventRow>`SELECT d.position, e.* FROM event_dispatch d JOIN session_events e ON e.event_id=d.event_id WHERE e.session_id=${sessionId} ORDER BY e.sequence`
 
-  // Derive a local Branch Head once for legacy Sessions. No legacy row is
-  // rewritten, and later Checkout operations update only local Peer state.
+  // Derive the default Peer's local Branch Head once for legacy Sessions. No
+  // legacy row is rewritten, and later Checkout operations update only local
+  // Peer state.
   const existingRows = yield* allRows().pipe(persist)
   const sessionIds = new Set(existingRows.map((row) => row.session_id))
   for (const sessionId of sessionIds) {
     const history = decodeHistory(existingRows.filter((row) => row.session_id === sessionId))
-    yield* sql`INSERT OR IGNORE INTO session_branch_heads (session_id, commit_id)
-      VALUES (${sessionId}, ${commitGraph(history).headId})`.pipe(persist)
+    yield* sql`INSERT OR IGNORE INTO peer_branch_heads (peer_id, session_id, commit_id)
+      VALUES (${defaultPeerId}, ${sessionId}, ${legacyBranchHead(history)})`.pipe(persist)
   }
 
   const insert = Effect.fn("Session.insert")(function*(
@@ -624,12 +650,18 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     return decodeHistory([row])[0]!
   })
 
+  const ensurePeerHead = (sessionId: string, peerId: string) => sql`
+    INSERT OR IGNORE INTO peer_branch_heads (peer_id, session_id, commit_id)
+    VALUES (${peerId}, ${sessionId}, NULL)
+  `
+
   const updateHeadIfCurrent = (
     sessionId: string,
+    peerId: string,
     expected: string | null,
     next: string
-  ) => sql`UPDATE session_branch_heads SET commit_id=${next}
-    WHERE session_id=${sessionId}
+  ) => sql`UPDATE peer_branch_heads SET commit_id=${next}
+    WHERE peer_id=${peerId} AND session_id=${sessionId}
       AND (commit_id=${expected} OR (commit_id IS NULL AND ${expected} IS NULL))`
 
   const responseParent = (
@@ -662,11 +694,13 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     eventType: ResponseCommitType,
     inReplyTo: string,
     runId: string | undefined,
+    peerId: string,
     payload: Record<string, unknown>,
     matchesExisting: (item: HistoryItem) => boolean
   ): Effect.Effect<ResponseCommitResult, PersistenceError> => Effect.gen(function*() {
     const rows = yield* sessionRows(sessionId)
     if (rows.length === 0) return { type: "NotFound" as const }
+    yield* ensurePeerHead(sessionId, peerId)
     const history = decodeHistory(rows)
     const existing = history.find(matchesExisting)
     if (existing !== undefined) {
@@ -684,10 +718,10 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       sessionId,
       commitId,
       eventType,
-      { ...payload, parentId, runId },
+      { ...payload, parentId, runId, peerId },
       rows.at(-1)!.sequence + 1
     )
-    yield* updateHeadIfCurrent(sessionId, parentId, commitId)
+    yield* updateHeadIfCurrent(sessionId, peerId, parentId, commitId)
     return { type: "Appended" as const, item: item as Commit }
   }).pipe(sql.withTransaction, persist)
 
@@ -704,28 +738,31 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
           {},
           1
         )
-        yield* sql`INSERT INTO session_branch_heads (session_id, commit_id) VALUES (${sessionId}, NULL)`
+        yield* sql`INSERT INTO peer_branch_heads (peer_id, session_id, commit_id)
+          VALUES (${defaultPeerId}, ${sessionId}, NULL)`
         return { type: "Created" as const, item: item as SessionCreated }
       }).pipe(sql.withTransaction, persist)
       if (result.type === "AlreadyExists") return yield* new AlreadyExists({ sessionId })
       return result.item
     }),
     appendUserCommit: Effect.fn("Session.appendUserCommit")(
-      function*(sessionId, content, commitId) {
+      function*(sessionId, content, commitId, requestedPeerId = defaultPeerId) {
         const result = yield* Effect.gen(function*() {
           const rows = yield* sessionRows(sessionId)
           if (rows.length === 0) return { type: "NotFound" as const }
+          yield* ensurePeerHead(sessionId, requestedPeerId)
           const heads = yield* sql<{ readonly commitId: string | null }>`
-            SELECT commit_id AS commitId FROM session_branch_heads WHERE session_id=${sessionId}`
+            SELECT commit_id AS commitId FROM peer_branch_heads
+            WHERE peer_id=${requestedPeerId} AND session_id=${sessionId}`
           const parentId = heads[0]?.commitId ?? null
           const item = yield* insert(
             sessionId,
             commitId,
             "UserCommit",
-            { content, parentId },
+            { content, parentId, peerId: requestedPeerId },
             rows.at(-1)!.sequence + 1
           )
-          yield* updateHeadIfCurrent(sessionId, parentId, commitId)
+          yield* updateHeadIfCurrent(sessionId, requestedPeerId, parentId, commitId)
           return {
             type: "Appended" as const,
             item: item as Extract<Commit, { type: "UserCommit" }>
@@ -745,11 +782,13 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       outcome,
       inReplyTo,
       index,
-      runId
+      runId,
+      requestedPeerId = defaultPeerId
     ) {
       const result = yield* Effect.gen(function*() {
         const rows = yield* sessionRows(sessionId)
         if (rows.length === 0) return { type: "NotFound" as const }
+        yield* ensurePeerHead(sessionId, requestedPeerId)
         const history = decodeHistory(rows)
         const existing = history.find(
           (item): item is Extract<Commit, { readonly type: "ToolCommit" }> =>
@@ -783,7 +822,12 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
           { toolCallId, name, input, outcome, inReplyTo, index, parentId, runId },
           rows.at(-1)!.sequence + 1
         )
-        yield* updateHeadIfCurrent(sessionId, parentId, commitId)
+        yield* updateHeadIfCurrent(
+          sessionId,
+          requestedPeerId,
+          parentId,
+          commitId
+        )
         return { type: "Appended" as const, item: item as Extract<Commit, { type: "ToolCommit" }> }
       }).pipe(sql.withTransaction, persist)
       if (result.type === "NotFound") return yield* new NotFound({ sessionId })
@@ -796,12 +840,13 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       return result.item as Extract<Commit, { readonly type: "ToolCommit" }>
     }),
     appendAgentMessageCommit: Effect.fn("Session.appendAgentMessageCommit")(
-      function*(sessionId, content, inReplyTo, runId) {
+      function*(sessionId, content, inReplyTo, runId, requestedPeerId = defaultPeerId) {
         const result = yield* appendResponseCommit(
           sessionId,
           "AgentMessageCommit",
           inReplyTo,
           runId,
+          requestedPeerId,
           { content, inReplyTo },
           (item) => item.type === "AgentMessageCommit" &&
             item.inReplyTo === inReplyTo &&
@@ -823,12 +868,13 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       }
     ),
     appendFailureCommit: Effect.fn("Session.appendFailureCommit")(
-      function*(sessionId, reason, inReplyTo, runId) {
+      function*(sessionId, reason, inReplyTo, runId, requestedPeerId = defaultPeerId) {
         const result = yield* appendResponseCommit(
           sessionId,
           "FailureCommit",
           inReplyTo,
           runId,
+          requestedPeerId,
           { reason, inReplyTo },
           (item) => item.type === "FailureCommit" &&
             item.inReplyTo === inReplyTo &&
@@ -849,7 +895,11 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         >
       }
     ),
-    checkout: Effect.fn("Session.checkout")(function*(sessionId, commitId) {
+    checkout: Effect.fn("Session.checkout")(function*(
+      sessionId,
+      commitId,
+      requestedPeerId = defaultPeerId
+    ) {
       const rows = yield* sessionRows(sessionId).pipe(persist)
       if (rows.length === 0) return yield* new NotFound({ sessionId })
       const history = decodeHistory(rows)
@@ -858,15 +908,23 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       )) {
         return yield* new CommitNotFound({ sessionId, commitId })
       }
-      yield* sql`UPDATE session_branch_heads SET commit_id=${commitId}
-        WHERE session_id=${sessionId}`.pipe(Effect.asVoid, persist)
+      yield* ensurePeerHead(sessionId, requestedPeerId).pipe(persist)
+      yield* sql`UPDATE peer_branch_heads SET commit_id=${commitId}
+        WHERE peer_id=${requestedPeerId} AND session_id=${sessionId}`.pipe(
+        Effect.asVoid,
+        persist
+      )
     }),
-    history: Effect.fn("Session.history")(function*(sessionId) {
+    history: Effect.fn("Session.history")(function*(
+      sessionId,
+      requestedPeerId = defaultPeerId
+    ) {
       const rows = yield* sessionRows(sessionId).pipe(persist)
+      yield* ensurePeerHead(sessionId, requestedPeerId).pipe(persist)
       const heads = yield* sql<{ readonly branchHeadId: string | null }>`
         SELECT commit_id AS branchHeadId
-        FROM session_branch_heads
-        WHERE session_id=${sessionId}`.pipe(persist)
+        FROM peer_branch_heads
+        WHERE peer_id=${requestedPeerId} AND session_id=${sessionId}`.pipe(persist)
       return {
         items: decodeHistory(rows),
         branchHeadId: heads[0]?.branchHeadId ?? null

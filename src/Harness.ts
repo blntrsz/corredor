@@ -454,19 +454,14 @@ const make = (
     const itemId = Session.historyItemId(item)
     if (knownItems.has(itemId)) return
     knownItems.set(itemId, item)
-    if (
-      Session.isBranchRecord(item) &&
-      item.parentId === branchHeadId
-    ) {
-      branchHeadId = Session.branchRecordId(item)
-    }
-
     if (item.type === "UserCommit" && pending?.commitId === item.commitId) {
+      branchHeadId = item.commitId
       pending.inReplyTo = item.commitId
     } else if (
       item.type === "AgentMessageCommit" &&
       pending?.inReplyTo === item.inReplyTo
     ) {
+      branchHeadId = item.commitId
       pending = undefined
       finish()
       return
@@ -637,6 +632,7 @@ const make = (
         if (stopped || controller.signal.aborted) return
         if (activeController === controller) activeController = undefined
         if (pending?.commitId === commitId) {
+          branchHeadId = commit.commitId
           pending.inReplyTo ??= commit.commitId
         }
       }).catch((error: unknown) => {

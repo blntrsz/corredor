@@ -3,6 +3,7 @@ import * as AgentRuntime from "./AgentRuntime.ts"
 import {
   branchHistory,
   commitGraph,
+  legacyBranchHead,
   type Commit,
   type HistoryItem,
   type LegacyNavigation
@@ -142,7 +143,10 @@ describe("Commit graph", () => {
       })
     ]
 
-    expect(commitGraph(history).headId).toBe("u2")
+    expect(commitGraph(history.slice(0, 3)).headId).toBe("a1")
+    expect(legacyBranchHead(history.slice(0, 3))).toBe("u1")
+    expect(commitGraph(history).headId).toBe("a1")
+    expect(legacyBranchHead(history)).toBe("u2")
     expect(commitGraph(history).nodes).toHaveLength(3)
   })
 })

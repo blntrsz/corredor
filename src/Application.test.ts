@@ -105,6 +105,95 @@ it.live(
 )
 
 it.live(
+  "persists Branch Heads per Peer and keeps Checkout isolated across restart",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-peer-heads-")
+    let responseNumber = 0
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: () => Effect.sync(() => `response-${++responseNumber}`)
+    }))
+
+    const first = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const session = yield* application.createSession("peer-session")
+      const user = yield* application.submitUserCommit(
+        session.sessionId,
+        "First request",
+        "peer-user-1",
+        "peer-a"
+      )
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const history = yield* application.history(session.sessionId, "peer-a")
+        if (history.items.some((item) => item.type === "AgentMessageCommit")) {
+          return { session, user, history }
+        }
+        yield* Effect.sleep("10 millis")
+      }
+      return yield* Effect.die("timed out waiting for Peer A")
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const peerA = yield* application.history(first.session.sessionId, "peer-a")
+      const peerB = yield* application.history(first.session.sessionId, "peer-b")
+      yield* application.checkout(first.session.sessionId, first.user.commitId, "peer-b")
+      const branchUser = yield* application.submitUserCommit(
+        first.session.sessionId,
+        "Divergent request",
+        "peer-user-2",
+        "peer-b"
+      )
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const history = yield* application.history(first.session.sessionId, "peer-b")
+        if (history.items.some(
+          (item) => item.type === "AgentMessageCommit" &&
+            item.inReplyTo === branchUser.commitId
+        )) {
+          const peerAAfter = yield* application.history(
+            first.session.sessionId,
+            "peer-a"
+          )
+          return { peerA, peerB, peerAAfter, history }
+        }
+        yield* Effect.sleep("10 millis")
+      }
+      return yield* Effect.die("timed out waiting for Peer B")
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    expect(first.history.branchHeadId).not.toBeNull()
+    expect(result.peerA.branchHeadId).toBe(first.history.branchHeadId)
+    expect(result.peerAAfter.branchHeadId).toBe(first.history.branchHeadId)
+    expect(result.peerB.branchHeadId).toBeNull()
+    expect(result.history.branchHeadId).not.toBe("peer-user-2")
+    expect(result.history.items).toContainEqual(
+      expect.objectContaining({
+        type: "AgentMessageCommit",
+        inReplyTo: "peer-user-2"
+      })
+    )
+    expect(result.history.items).toContainEqual(
+      expect.objectContaining({
+        type: "UserCommit",
+        commitId: "peer-user-1",
+        parentId: null
+      })
+    )
+    expect(result.history.items).toContainEqual(
+      expect.objectContaining({
+        type: "UserCommit",
+        commitId: "peer-user-2",
+        parentId: "peer-user-1"
+      })
+    )
+    const activity = yield* Effect.gen(function*() {
+      const store = yield* Session.Service
+      return yield* store.activityAfter(0)
+    }).pipe(Effect.provide(Session.layer(path)))
+    expect(activity.some((item) => item.type === "LegacyNavigation")).toBe(false)
+  })
+)
+
+it.live(
   "a Tool Commit appears only after completion and records failure atomically",
   () => Effect.gen(function*() {
     const { path } = yield* temporaryDatabase("corredor-tool-failure-")
