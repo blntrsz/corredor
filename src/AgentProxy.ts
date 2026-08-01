@@ -50,6 +50,15 @@ export interface Interface {
     definition: Agent.Definition,
     runId?: string
   ) => Effect.Effect<void, ProxyError>
+  readonly interruptAgentRun: (
+    sessionId: string,
+    startingCommitId: string,
+    reason?: string,
+    runId?: string
+  ) => Effect.Effect<
+    Extract<Session.Commit, { readonly type: "InterruptCommit" }> | undefined,
+    ProxyError
+  >
   readonly listSessions: (
     workstreamId?: string,
     view?: Session.SessionListView
@@ -81,6 +90,9 @@ const CreateWorkstreamResponse = Schema.Struct({
   workstream: Session.WorkstreamSchema
 })
 const CommitResponse = Schema.Struct({ commit: Session.CommitSchema })
+const InterruptResponse = Schema.Struct({
+  commit: Schema.NullOr(Session.CommitSchema)
+})
 const SessionsResponse = Schema.Struct({
   sessions: Schema.Array(Session.SessionSummarySchema)
 })
@@ -279,6 +291,30 @@ export const make = (
           agent: definition,
           ...(runId === undefined ? {} : { runId })
         }))))
+      }
+    ),
+    interruptAgentRun: Effect.fn("AgentProxy.interruptAgentRun")(
+      function*(
+        sessionId: string,
+        startingCommitId: string,
+        reason?: string,
+        runId?: string
+      ) {
+        const body = yield* responseJson(withPeer(HttpClientRequest.post(
+          url(`/v1/sessions/${encodeURIComponent(sessionId)}/interrupt`)
+        ).pipe(HttpClientRequest.bodyJsonUnsafe({
+          commitId: startingCommitId,
+          ...(reason === undefined ? {} : { reason }),
+          ...(runId === undefined ? {} : { runId })
+        }))))
+        const decoded = yield* Schema.decodeUnknownEffect(InterruptResponse)(body)
+          .pipe(Effect.mapError(proxyError))
+        return decoded.commit === null
+          ? undefined
+          : decoded.commit as Extract<
+            Session.Commit,
+            { readonly type: "InterruptCommit" }
+          >
       }
     ),
     listSessions: Effect.fn("AgentProxy.listSessions")(function*(

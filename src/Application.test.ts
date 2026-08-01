@@ -273,7 +273,7 @@ it.live(
   () => Effect.gen(function*() {
     const { path } = yield* temporaryDatabase("corredor-agent-failure-")
     const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
-      run: () => Effect.die("model process crashed")
+      run: () => Effect.die(new Error("model process crashed\nhidden stack"))
     }))
 
     const failure = yield* Effect.gen(function*() {
@@ -302,6 +302,277 @@ it.live(
       parentId: "failure-user"
     })
     expect(failure.reason).toContain("model process crashed")
+    expect(failure.reason).not.toContain("hidden stack")
+  })
+)
+
+it.live(
+  "interrupts model output into one durable Interrupt Commit without hidden state",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-agent-interrupt-")
+    let markOutputSeen!: () => void
+    const outputSeen = new Promise<void>((resolve) => {
+      markOutputSeen = resolve
+    })
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (_context, onEvent) => Effect.gen(function*() {
+        yield* onEvent({ type: "TextDelta", text: "partial answer" })
+        markOutputSeen()
+        yield* Effect.promise(() => new Promise<void>(() => undefined))
+        return "unreachable"
+      })
+    }))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const session = yield* application.createSession("interrupt-session")
+      const user = yield* application.submitUserCommit(
+        session.sessionId,
+        "Answer slowly",
+        "interrupt-user"
+      )
+      yield* Effect.promise(() => outputSeen)
+      const before = yield* application.history(session.sessionId)
+      yield* application.interruptAgentRun(
+        session.sessionId,
+        user.commitId,
+        "Stopped by the user"
+      )
+      const after = yield* application.history(session.sessionId)
+      const activity = (yield* application.activityAfter(session.position))
+        .filter((item) => item.sessionId === session.sessionId)
+      return { before, after, activity }
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    expect(result.before.items.map((item) => item.type)).toEqual([
+      "SessionCreated",
+      "UserCommit"
+    ])
+    expect(result.after.items.filter(Session.isCommit)).toEqual([
+      expect.objectContaining({
+        type: "UserCommit",
+        commitId: "interrupt-user"
+      }),
+      expect.objectContaining({
+        type: "InterruptCommit",
+        inReplyTo: "interrupt-user",
+        reason: "Stopped by the user",
+        partialOutput: "partial answer"
+      })
+    ])
+    expect(result.after.items.some((item) => item.type === "AgentMessageCommit"))
+      .toBe(false)
+    expect(result.after.items.some((item) => item.type === "ToolCommit"))
+      .toBe(false)
+    expect(result.after.branchHeadId).toBe(
+      result.after.items.find((item) => item.type === "InterruptCommit")?.commitId
+    )
+    expect(result.activity.map((item) => item.type)).toEqual([
+      "UserCommit",
+      "InterruptCommit"
+    ])
+  })
+)
+
+it.live(
+  "interrupts an in-progress tool without persisting a half-complete Tool Commit",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-tool-interrupt-")
+    let markToolStarted!: () => void
+    const toolStarted = new Promise<void>((resolve) => {
+      markToolStarted = resolve
+    })
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (_context, onEvent) => Effect.gen(function*() {
+        yield* onEvent({
+          type: "ToolCall",
+          id: "slow-tool",
+          name: "Lookup",
+          input: { query: "still running" }
+        })
+        markToolStarted()
+        yield* Effect.promise(() => new Promise<void>(() => undefined))
+        yield* onEvent({
+          type: "ToolResult",
+          id: "slow-tool",
+          name: "Lookup",
+          result: { answer: 42 },
+          isFailure: false
+        })
+        return "unreachable"
+      })
+    }))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const session = yield* application.createSession("tool-interrupt-session")
+      const user = yield* application.submitUserCommit(
+        session.sessionId,
+        "Run a slow lookup",
+        "tool-interrupt-user"
+      )
+      yield* Effect.promise(() => toolStarted)
+      yield* application.interruptAgentRun(
+        session.sessionId,
+        user.commitId,
+        "  "
+      )
+      return yield* application.history(session.sessionId)
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    expect(result.items.filter((item) => item.type === "ToolCommit")).toEqual([])
+    expect(result.items.filter((item) => item.type === "InterruptCommit")).toEqual([
+      expect.objectContaining({
+        type: "InterruptCommit",
+        inReplyTo: "tool-interrupt-user",
+        reason: "Interrupted by user",
+        partialOutput: ""
+      })
+    ])
+  })
+)
+
+it.live(
+  "continues after an Interrupt Commit with a fresh stateless Agent Run",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-interrupt-continuation-")
+    const contexts: Array<ReadonlyArray<Agent.ContextEntry>> = []
+    let markOutputSeen!: () => void
+    const outputSeen = new Promise<void>((resolve) => {
+      markOutputSeen = resolve
+    })
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (context, onEvent) => Effect.gen(function*() {
+        contexts.push(context)
+        if (contexts.length === 1) {
+          yield* onEvent({ type: "TextDelta", text: "unfinished" })
+          markOutputSeen()
+          yield* Effect.promise(() => new Promise<void>(() => undefined))
+        }
+        return "continued from durable history"
+      })
+    }))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const session = yield* application.createSession("interrupt-continuation")
+      const first = yield* application.submitUserCommit(
+        session.sessionId,
+        "Start the work",
+        "continuation-first-user"
+      )
+      yield* Effect.promise(() => outputSeen)
+      yield* application.interruptAgentRun(
+        session.sessionId,
+        first.commitId,
+        "Pause here"
+      )
+      const second = yield* application.submitUserCommit(
+        session.sessionId,
+        "Continue from the interruption",
+        "continuation-second-user"
+      )
+
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const history = yield* application.history(session.sessionId)
+        if (history.items.some(
+          (item) => item.type === "AgentMessageCommit" &&
+            item.inReplyTo === second.commitId
+        )) return history
+        yield* Effect.sleep("10 millis")
+      }
+      return yield* Effect.die("timed out waiting for continuation")
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    expect(contexts).toHaveLength(2)
+    expect(contexts[0]?.map((entry) => entry.type)).toEqual(["User"])
+    expect(contexts[1]?.map((entry) => entry.type)).toEqual([
+      "User",
+      "Interrupt",
+      "User"
+    ])
+    expect(contexts[1]?.find((entry) => entry.type === "Interrupt"))
+      .toMatchObject({
+        reason: "Pause here",
+        partialOutput: "unfinished"
+      })
+    expect(result.items).toContainEqual(expect.objectContaining({
+      type: "InterruptCommit",
+      inReplyTo: "continuation-first-user",
+      reason: "Pause here"
+    }))
+    expect(result.items).toContainEqual(expect.objectContaining({
+      type: "AgentMessageCommit",
+      inReplyTo: "continuation-second-user",
+      content: "continued from durable history"
+    }))
+  })
+)
+
+it.live(
+  "continues after a Failure Commit when the Agent Runtime is recreated",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-failure-continuation-")
+    const firstAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: () => Effect.die("provider stopped unexpectedly")
+    }))
+
+    yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const session = yield* application.createSession("failure-continuation")
+      yield* application.submitUserCommit(
+        session.sessionId,
+        "Do the work",
+        "failure-continuation-first"
+      )
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const history = yield* application.history(session.sessionId)
+        if (history.items.some((item) => item.type === "FailureCommit")) return
+        yield* Effect.sleep("10 millis")
+      }
+      return yield* Effect.die("timed out waiting for Failure Commit")
+    }).pipe(Effect.provide(runtimeLayer(path, firstAgent)))
+
+    let secondContext: ReadonlyArray<Agent.ContextEntry> = []
+    const secondAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (context) => Effect.sync(() => {
+        secondContext = context
+        return "recovered after restart"
+      })
+    }))
+
+    const history = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      yield* application.submitUserCommit(
+        "failure-continuation",
+        "Try again after the failure",
+        "failure-continuation-second"
+      )
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const snapshot = yield* application.history("failure-continuation")
+        if (snapshot.items.some(
+          (item) => item.type === "AgentMessageCommit" &&
+            item.inReplyTo === "failure-continuation-second"
+        )) return snapshot
+        yield* Effect.sleep("10 millis")
+      }
+      return yield* Effect.die("timed out waiting for restarted continuation")
+    }).pipe(Effect.provide(runtimeLayer(path, secondAgent)))
+
+    expect(secondContext.map((entry) => entry.type)).toEqual([
+      "User",
+      "Failure",
+      "User"
+    ])
+    expect(history.items).toContainEqual(expect.objectContaining({
+      type: "FailureCommit",
+      reason: "provider stopped unexpectedly"
+    }))
+    expect(history.items).toContainEqual(expect.objectContaining({
+      type: "AgentMessageCommit",
+      inReplyTo: "failure-continuation-second",
+      content: "recovered after restart"
+    }))
   })
 )
 

@@ -54,6 +54,13 @@ export type Commit =
     readonly inReplyTo: string
     readonly runId?: string
   }
+  | CommitMetadata & {
+    readonly type: "InterruptCommit"
+    readonly reason: string
+    readonly partialOutput: string
+    readonly inReplyTo: string
+    readonly runId?: string
+  }
 
 export interface LegacyToolCall {
   readonly type: "LegacyToolCall"
@@ -120,12 +127,14 @@ export type BranchRecord = Commit | LegacyToolCall
 type UserCommit = Extract<Commit, { readonly type: "UserCommit" }>
 type AgentMessageCommit = Extract<Commit, { readonly type: "AgentMessageCommit" }>
 type FailureCommit = Extract<Commit, { readonly type: "FailureCommit" }>
+type InterruptCommit = Extract<Commit, { readonly type: "InterruptCommit" }>
 type ToolCommit = Extract<Commit, { readonly type: "ToolCommit" }>
 
 export interface BranchRecordHandlers<A> {
   readonly user: (record: UserCommit) => A
   readonly agentMessage: (record: AgentMessageCommit) => A
   readonly failure: (record: FailureCommit) => A
+  readonly interrupt: (record: InterruptCommit) => A
   readonly tool: (record: ToolCommit) => A
   readonly legacyTool: (record: LegacyToolCall) => A
 }
@@ -138,6 +147,7 @@ export const foldBranchRecord = <A>(
   if (record.type === "UserCommit") return handlers.user(record)
   if (record.type === "AgentMessageCommit") return handlers.agentMessage(record)
   if (record.type === "FailureCommit") return handlers.failure(record)
+  if (record.type === "InterruptCommit") return handlers.interrupt(record)
   if (record.type === "ToolCommit") return handlers.tool(record)
   return handlers.legacyTool(record)
 }
@@ -214,6 +224,15 @@ const FailureCommitSchema = Schema.Struct({
   runId: Schema.optional(Schema.String)
 })
 
+const InterruptCommitSchema = Schema.Struct({
+  ...commitMetadata,
+  type: Schema.Literal("InterruptCommit"),
+  reason: Schema.String,
+  partialOutput: Schema.String,
+  inReplyTo: Schema.String,
+  runId: Schema.optional(Schema.String)
+})
+
 export const SessionCreatedSchema = Schema.Struct({
   ...historyMetadata,
   type: Schema.Literal("SessionCreated"),
@@ -242,6 +261,7 @@ export const HistoryItemSchema = Schema.Union([
   ToolCommitSchema,
   AgentMessageCommitSchema,
   FailureCommitSchema,
+  InterruptCommitSchema,
   Schema.Struct({
     ...historyMetadata,
     type: Schema.Literal("LegacyToolCall"),
@@ -270,7 +290,8 @@ export const CommitSchema = Schema.Union([
   UserCommitSchema,
   ToolCommitSchema,
   AgentMessageCommitSchema,
-  FailureCommitSchema
+  FailureCommitSchema,
+  InterruptCommitSchema
 ])
 
 export const HistorySnapshotSchema = Schema.Struct({
@@ -396,7 +417,8 @@ export const isCommit = (item: HistoryItem): item is Commit =>
   item.type === "UserCommit" ||
   item.type === "ToolCommit" ||
   item.type === "AgentMessageCommit" ||
-  item.type === "FailureCommit"
+  item.type === "FailureCommit" ||
+  item.type === "InterruptCommit"
 
 export const isBranchRecord = (item: HistoryItem): item is BranchRecord =>
   isCommit(item) || item.type === "LegacyToolCall"
@@ -556,6 +578,14 @@ export interface Interface {
     runId?: string,
     peerId?: string
   ) => Effect.Effect<Extract<Commit, { readonly type: "FailureCommit" }>, Error>
+  readonly appendInterruptCommit: (
+    sessionId: string,
+    reason: string,
+    partialOutput: string,
+    inReplyTo: string,
+    runId?: string,
+    peerId?: string
+  ) => Effect.Effect<Extract<Commit, { readonly type: "InterruptCommit" }>, Error>
   readonly checkout: (
     sessionId: string,
     commitId: string | null,
@@ -581,6 +611,7 @@ type RawEventType =
   | "ToolCommit"
   | "AgentMessageCommit"
   | "FailureCommit"
+  | "InterruptCommit"
   | "UserMessageAdded"
   | "AgentToolCallAdded"
   | "AgentMessageAdded"
@@ -705,6 +736,23 @@ const decodeHistory = (rows: ReadonlyArray<EventRow>): ReadonlyArray<HistoryItem
         parentId,
         createdAt,
         reason: String(payload.reason ?? "Agent run failed"),
+        inReplyTo: String(payload.inReplyTo ?? ""),
+        ...(typeof payload.runId === "string" ? { runId: payload.runId } : {})
+      }
+      items.push(commit)
+      if (parentId === currentHead) heads.set(row.session_id, commit.commitId)
+      continue
+    }
+
+    if (row.event_type === "InterruptCommit") {
+      const commit: Commit = {
+        ...metadata,
+        type: "InterruptCommit",
+        commitId: row.event_id,
+        parentId,
+        createdAt,
+        reason: String(payload.reason ?? "Agent run interrupted"),
+        partialOutput: String(payload.partialOutput ?? ""),
         inReplyTo: String(payload.inReplyTo ?? ""),
         ...(typeof payload.runId === "string" ? { runId: payload.runId } : {})
       }
@@ -960,7 +1008,10 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     return toolEntries.map(branchRecordId).at(-1) ?? inReplyTo
   }
 
-  type ResponseCommitType = "AgentMessageCommit" | "FailureCommit"
+  type ResponseCommitType =
+    | "AgentMessageCommit"
+    | "FailureCommit"
+    | "InterruptCommit"
   type ResponseCommitResult =
     | { readonly type: "NotFound" }
     | { readonly type: "Settled" }
@@ -1331,6 +1382,44 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         return result.item as Extract<
           Commit,
           { readonly type: "FailureCommit" }
+        >
+      }
+    ),
+    appendInterruptCommit: Effect.fn("Session.appendInterruptCommit")(
+      function*(
+        sessionId,
+        reason,
+        partialOutput,
+        inReplyTo,
+        runId,
+        requestedPeerId = defaultPeerId
+      ) {
+        const result = yield* appendResponseCommit(
+          sessionId,
+          "InterruptCommit",
+          inReplyTo,
+          runId,
+          requestedPeerId,
+          { reason, partialOutput, inReplyTo },
+          (item) => item.type === "InterruptCommit" &&
+            item.inReplyTo === inReplyTo &&
+            item.runId === runId
+        )
+        if (result.type === "NotFound") {
+          return yield* new NotFound({ sessionId })
+        }
+        if (result.type === "Settled") {
+          return yield* new Settled({ sessionId })
+        }
+        if (result.type === "CommitNotFound") {
+          return yield* new CommitNotFound({
+            sessionId,
+            commitId: result.commitId
+          })
+        }
+        return result.item as Extract<
+          Commit,
+          { readonly type: "InterruptCommit" }
         >
       }
     ),

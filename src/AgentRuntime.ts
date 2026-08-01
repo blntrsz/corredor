@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, Layer } from "effect"
+import { Cause, Context, Deferred, Effect, Layer } from "effect"
 import { Agent } from "./Agent.ts"
 import * as Session from "./Session.ts"
 
@@ -13,11 +13,59 @@ export interface Interface {
     runId?: string,
     peerId?: string
   ) => Effect.Effect<void, Session.Error | Session.PersistenceError>
+  /** Requests an active Agent Run to stop and records its durable outcome. */
+  readonly interrupt: (
+    sessionId: string,
+    startingCommitId: string,
+    reason?: string,
+    runId?: string
+  ) => Effect.Effect<
+    Extract<Session.Commit, { readonly type: "InterruptCommit" }> | undefined,
+    Session.Error | Session.PersistenceError
+  >
 }
 
 export class Service extends Context.Service<Service, Interface>()(
   "@corredor/AgentRuntime"
 ) {}
+
+const defaultFailureReason = "Agent run failed"
+const defaultInterruptReason = "Interrupted by user"
+
+const visibleInterruptReason = (reason?: string): string => {
+  const normalized = reason?.trim() ?? ""
+  return normalized.length === 0
+    ? defaultInterruptReason
+    : normalized.slice(0, 500)
+}
+
+const reasonMessage = (value: unknown): string | undefined => {
+  if (value instanceof Error) return value.message
+  if (typeof value === "string") return value
+  if (value === null || typeof value !== "object") return undefined
+  if ("message" in value && typeof value.message === "string") {
+    return value.message
+  }
+  if ("reason" in value) return reasonMessage(value.reason)
+  return undefined
+}
+
+const visibleReason = (value: unknown): string => {
+  const raw = reasonMessage(value) ?? defaultFailureReason
+  const firstLine = raw.trim().split("\n", 1)[0]?.trim() ?? ""
+  return firstLine.length === 0
+    ? defaultFailureReason
+    : firstLine.slice(0, 500)
+}
+
+/** Keeps stack traces, provider payloads, and hidden model state out of history. */
+const safeFailureReason = (cause: Cause.Cause<unknown>): string => {
+  for (const reason of cause.reasons) {
+    if (Cause.isFailReason(reason)) return visibleReason(reason.error)
+    if (Cause.isDieReason(reason)) return visibleReason(reason.defect)
+  }
+  return defaultFailureReason
+}
 
 /** Legacy projected users are readable history, not new work to execute. */
 export const isRunnableUserCommit = (
@@ -46,6 +94,12 @@ const agentContext = (
         type: "Failure" as const,
         commitId: entry.commitId,
         reason: entry.reason
+      }),
+      interrupt: (entry) => ({
+        type: "Interrupt" as const,
+        commitId: entry.commitId,
+        reason: entry.reason,
+        partialOutput: entry.partialOutput
       }),
       tool: (entry) => ({
         type: "Tool" as const,
@@ -79,7 +133,30 @@ export const make = Effect.gen(function*() {
   const store = yield* Session.Service
   const agent = yield* Agent.Service
 
-  const start = Effect.fn("AgentRuntime.start")(function*(
+  type InterruptRequest = {
+    readonly reason: string
+  }
+  type InterruptCommit = Extract<
+    Session.Commit,
+    { readonly type: "InterruptCommit" }
+  >
+  interface ActiveRun {
+    readonly sessionId: string
+    readonly startingCommitId: string
+    readonly runId?: string
+    readonly request: Deferred.Deferred<InterruptRequest>
+    readonly completed: Deferred.Deferred<InterruptCommit | undefined>
+    partialOutput: string
+  }
+
+  const activeRuns = new Map<string, ActiveRun>()
+  const runKey = (
+    sessionId: string,
+    startingCommitId: string,
+    runId?: string
+  ): string => JSON.stringify([sessionId, startingCommitId, runId ?? null])
+
+  const start: Interface["start"] = Effect.fn("AgentRuntime.start")(function*(
     sessionId: string,
     startingCommitId: string,
     definition: Agent.Definition,
@@ -103,11 +180,28 @@ export const make = Effect.gen(function*() {
     }
     const existingOutcome = snapshot.items.find((candidate) =>
       (candidate.type === "AgentMessageCommit" ||
-        candidate.type === "FailureCommit") &&
+        candidate.type === "FailureCommit" ||
+        candidate.type === "InterruptCommit") &&
       candidate.inReplyTo === startingCommitId &&
       candidate.runId === runId
     )
     if (existingOutcome !== undefined) return
+
+    const request = yield* Deferred.make<InterruptRequest>()
+    const completed = yield* Deferred.make<InterruptCommit | undefined>()
+    const active: ActiveRun = {
+      sessionId,
+      startingCommitId,
+      runId,
+      request,
+      completed,
+      partialOutput: ""
+    }
+    const key = runKey(sessionId, startingCommitId, runId)
+    if (activeRuns.has(key)) return
+    activeRuns.set(key, active)
+
+    let interruptCommit: InterruptCommit | undefined
 
     const durableToolCommits = snapshot.items.filter(
       (candidate): candidate is Extract<
@@ -127,52 +221,145 @@ export const make = Effect.gen(function*() {
     }>()
     let nextToolIndex = (durableToolCommits.at(-1)?.index ?? -1) + 1
 
-    yield* Effect.matchCauseEffect(agent.run(
-      agentContext(snapshot.items, runHeadId),
-      (agentEvent) => {
-        if (agentEvent.type === "ToolCall") {
-          toolCalls.set(agentEvent.id, {
-            id: agentEvent.id,
-            name: agentEvent.name,
-            input: agentEvent.input,
-            index: nextToolIndex++
-          })
-          return Effect.void
-        }
+    yield* Effect.ensuring(
+      Effect.matchCauseEffect(
+        Effect.raceFirst(
+          agent.run(
+            agentContext(snapshot.items, runHeadId),
+            (agentEvent) => {
+              if (agentEvent.type === "TextDelta") {
+                active.partialOutput += agentEvent.text
+                return Effect.void
+              }
+              if (agentEvent.type === "ToolCall") {
+                toolCalls.set(agentEvent.id, {
+                  id: agentEvent.id,
+                  name: agentEvent.name,
+                  input: agentEvent.input,
+                  index: nextToolIndex++
+                })
+                return Effect.void
+              }
 
-        const call = toolCalls.get(agentEvent.id)
-        if (call === undefined) return Effect.void
-        return store.appendToolCommit(
-          sessionId,
-          call.id,
-          call.name,
-          call.input,
-          agentEvent.isFailure
-            ? { type: "Failure", failure: agentEvent.result }
-            : { type: "Success", result: agentEvent.result },
-          startingCommitId,
-          call.index,
-          runId,
-          requestedPeerId
-        ).pipe(Effect.asVoid)
-      },
-      definition
-    ), {
-      onFailure: (cause) => store.appendFailureCommit(
+              const call = toolCalls.get(agentEvent.id)
+              if (call === undefined) return Effect.void
+              return store.appendToolCommit(
+                sessionId,
+                call.id,
+                call.name,
+                call.input,
+                agentEvent.isFailure
+                  ? { type: "Failure", failure: agentEvent.result }
+                  : { type: "Success", result: agentEvent.result },
+                startingCommitId,
+                call.index,
+                runId,
+                requestedPeerId
+              ).pipe(Effect.asVoid)
+            },
+            definition
+          ).pipe(
+            Effect.map((response) => ({
+              type: "Completed" as const,
+              response
+            }))
+          ),
+          Deferred.await(request).pipe(Effect.map((request) => ({
+            type: "Interrupted" as const,
+            request
+          })))
+        ),
+        {
+          onFailure: (cause) => {
+            return Effect.uninterruptible(
+              store.appendFailureCommit(
+                sessionId,
+                safeFailureReason(cause),
+                startingCommitId,
+                runId,
+                requestedPeerId
+              ).pipe(Effect.asVoid)
+            )
+          },
+          onSuccess: (outcome) => outcome.type === "Interrupted"
+            ? Effect.uninterruptible(
+              store.appendInterruptCommit(
+                sessionId,
+                outcome.request.reason,
+                active.partialOutput,
+                startingCommitId,
+                runId,
+                requestedPeerId
+              ).pipe(
+                Effect.tap((commit) => Effect.sync(() => {
+                  interruptCommit = commit
+                })),
+                Effect.asVoid
+              )
+            )
+            : Effect.uninterruptible(
+              store.appendAgentMessageCommit(
+                sessionId,
+                outcome.response,
+                startingCommitId,
+                runId,
+                requestedPeerId
+              ).pipe(Effect.asVoid)
+            )
+        }
+      ),
+      Effect.gen(function*() {
+        activeRuns.delete(key)
+        yield* Deferred.succeed(completed, interruptCommit)
+      })
+    )
+  })
+
+  const interrupt = Effect.fn("AgentRuntime.interrupt")(function*(
+    sessionId: string,
+    startingCommitId: string,
+    reason?: string,
+    requestedRunId?: string
+  ) {
+    const snapshot = yield* store.history(sessionId)
+    if (snapshot.settled) {
+      return yield* new Session.Settled({ sessionId })
+    }
+    const startingCommit = snapshot.items.find(
+      (item): item is Session.Commit =>
+        Session.isCommit(item) && item.commitId === startingCommitId
+    )
+    if (startingCommit === undefined) {
+      return yield* new Session.CommitNotFound({
         sessionId,
-        Cause.pretty(cause),
-        startingCommitId,
-        runId,
-        requestedPeerId
-      ).pipe(Effect.asVoid),
-      onSuccess: (response) => store.appendAgentMessageCommit(
-        sessionId,
-        response,
-        startingCommitId,
-        runId,
-        requestedPeerId
-      ).pipe(Effect.asVoid)
+        commitId: startingCommitId
+      })
+    }
+    const existingInterrupt = snapshot.items.find(
+      (item): item is InterruptCommit =>
+        item.type === "InterruptCommit" &&
+        item.inReplyTo === startingCommitId &&
+        item.runId === requestedRunId
+    )
+    if (existingInterrupt !== undefined) return existingInterrupt
+    const findActive = () => [...activeRuns.values()].find((candidate) =>
+      candidate.sessionId === sessionId &&
+      candidate.startingCommitId === startingCommitId &&
+      (requestedRunId === undefined
+        ? candidate.runId === undefined
+        : candidate.runId === requestedRunId)
+    )
+    let active: ActiveRun | undefined
+    for (let attempt = 0; attempt < 20; attempt++) {
+      active = findActive()
+      if (active !== undefined) break
+      if (attempt < 19) yield* Effect.sleep("10 millis")
+    }
+    if (active === undefined) return undefined
+    yield* Deferred.succeed(active.request, {
+      reason: visibleInterruptReason(reason)
     })
+    return yield* Deferred.await(active.completed)
   })
 
   const react = Effect.fn("AgentRuntime.react")(function*(
@@ -206,7 +393,7 @@ export const make = Effect.gen(function*() {
     Effect.forkScoped
   )
 
-  return Service.of({ start })
+  return Service.of({ start, interrupt })
 })
 
 export const layerWithoutDependencies = Layer.effect(Service, make)

@@ -1,5 +1,5 @@
 import { OpenAiClient, OpenAiLanguageModel } from "@effect/ai-openai-compat"
-import { Config, Context, Effect, Layer, Schema, Semaphore } from "effect"
+import { Config, Context, Effect, Layer, Schema, Semaphore, Stream } from "effect"
 import { AiError, Chat, LanguageModel, Tool, Toolkit } from "effect/unstable/ai"
 import { FetchHttpClient } from "effect/unstable/http"
 
@@ -99,7 +99,30 @@ export namespace Agent {
 
   export type Error = ModelError | TurnLimitExceeded | BashError
 
+  const modelStreamErrorMessage = (value: unknown): string => {
+    if (value instanceof Error) return value.message
+    if (typeof value === "string") return value
+    if (value !== null && typeof value === "object" &&
+      "message" in value && typeof value.message === "string") {
+      return value.message
+    }
+    return "Model stream failed"
+  }
+
+  const modelStreamErrorReason = (value: unknown): AiError.AiErrorReason =>
+    AiError.isAiError(value)
+      ? value.reason
+      : AiError.isAiErrorReason(value)
+      ? value
+      : new AiError.UnknownError({
+        description: modelStreamErrorMessage(value)
+      })
+
   export type Event =
+    | {
+      readonly type: "TextDelta"
+      readonly text: string
+    }
     | {
       readonly type: "ToolCall"
       readonly id: string
@@ -139,6 +162,12 @@ export namespace Agent {
       readonly type: "Failure"
       readonly commitId: string
       readonly reason: string
+    }
+    | {
+      readonly type: "Interrupt"
+      readonly commitId: string
+      readonly reason: string
+      readonly partialOutput: string
     }
 
   export interface Interface {
@@ -190,6 +219,14 @@ export namespace Agent {
               content: `[Previous Agent Run failed: ${entry.reason}]`
             }
           }
+          if (entry.type === "Interrupt") {
+            return {
+              role: "assistant" as const,
+              content: `[Previous Agent Run interrupted: ${entry.reason}]${
+                entry.partialOutput.length > 0 ? `\n${entry.partialOutput}` : ""
+              }`
+            }
+          }
           const outcome = entry.outcome.type === "Success"
             ? { result: entry.outcome.value }
             : { failure: entry.outcome.value }
@@ -207,25 +244,30 @@ export namespace Agent {
         ])
 
         for (let turn = 0; turn < maxTurns; turn++) {
-          const response = yield* chat.generateText({
+          let responseText = ""
+          let hasToolCall = false
+          const stream = chat.streamText({
             prompt: turn === 0 ? prompt : [],
             toolkit
-          }).pipe(
-            Effect.provideService(LanguageModel.LanguageModel, languageModel),
-            Effect.catchTag("AiError", (error) =>
-              Effect.fail(new ModelError({ reason: error.reason })))
-          )
-
-          for (const part of response.content) {
+          })
+          yield* Stream.runForEach(stream, (part) => {
+            if (part.type === "text-delta") {
+              responseText += part.delta
+              return part.delta.length === 0
+                ? Effect.void
+                : onEvent({ type: "TextDelta", text: part.delta })
+            }
             if (part.type === "tool-call") {
-              yield* onEvent({
+              hasToolCall = true
+              return onEvent({
                 type: "ToolCall",
                 id: part.id,
                 name: part.name,
                 input: part.params
               })
-            } else if (part.type === "tool-result") {
-              yield* onEvent({
+            }
+            if (part.type === "tool-result") {
+              return onEvent({
                 type: "ToolResult",
                 id: part.id,
                 name: part.name,
@@ -233,11 +275,21 @@ export namespace Agent {
                 isFailure: part.isFailure
               })
             }
-          }
+            if (part.type === "error") {
+              return Effect.fail<E | ModelError>(new ModelError({
+                reason: modelStreamErrorReason(part.error)
+              }))
+            }
+            return Effect.void
+          }).pipe(
+            Effect.provideService(LanguageModel.LanguageModel, languageModel),
+            Effect.catchTag("AiError", (error) =>
+              Effect.fail(new ModelError({
+                reason: (error as AiError.AiError).reason
+              }))),
+          )
 
-          if (response.toolCalls.length === 0) {
-            return response.text
-          }
+          if (!hasToolCall) return responseText
         }
 
         return yield* new TurnLimitExceeded({ maxTurns })

@@ -152,6 +152,74 @@ it.live(
 )
 
 it.live(
+  "interrupts a streamed Agent Run through the HTTP boundary",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-http-interrupt-")
+    const port = yield* Effect.promise(availablePort)
+    const baseUrl = `http://127.0.0.1:${port}`
+    let markOutputSeen!: () => void
+    const outputSeen = new Promise<void>((resolve) => {
+      markOutputSeen = resolve
+    })
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (_context, onEvent) => Effect.gen(function*() {
+        yield* onEvent({ type: "TextDelta", text: "partial over HTTP" })
+        markOutputSeen()
+        yield* Effect.promise(() => new Promise<void>(() => undefined))
+        return "unreachable"
+      })
+    }))
+    const layer = Layer.mergeAll(
+      Server.layerWithoutDependencies({ host: "127.0.0.1", port }),
+      AgentProxy.layer({ baseUrl, peerId: "http-interrupt-peer" })
+    ).pipe(
+      Layer.provide(Session.layer(path)),
+      Layer.provide(fakeAgent)
+    )
+
+    const result = yield* Effect.gen(function*() {
+      const proxy = yield* AgentProxy.Service
+      const session = yield* proxy.createSession("http-interrupt-session")
+      const activityFiber = yield* proxy.streamActivity(
+        session.sessionId,
+        session.position
+      ).pipe(
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkScoped
+      )
+      const user = yield* proxy.submitUserCommit(
+        session.sessionId,
+        "Answer until stopped",
+        "http-interrupt-user"
+      )
+      yield* Effect.promise(() => outputSeen)
+      const interrupt = yield* proxy.interruptAgentRun(
+        session.sessionId,
+        user.commitId,
+        "Stopped from the client"
+      )
+      const activity = Array.from(yield* Fiber.join(activityFiber))
+      const history = yield* proxy.history(session.sessionId)
+      return { interrupt, activity, history }
+    }).pipe(Effect.provide(layer))
+
+    expect(result.interrupt).toMatchObject({
+      type: "InterruptCommit",
+      inReplyTo: "http-interrupt-user",
+      reason: "Stopped from the client",
+      partialOutput: "partial over HTTP"
+    })
+    expect(result.activity.map((item) => item.type)).toEqual([
+      "UserCommit",
+      "InterruptCommit"
+    ])
+    expect(result.history.items.some((item) => item.type === "FailureCommit"))
+      .toBe(false)
+  })
+)
+
+it.live(
   "creates Workstreams and groups public Session operations under them",
   () => Effect.gen(function*() {
     const { path } = yield* temporaryDatabase("corredor-workstreams-")
