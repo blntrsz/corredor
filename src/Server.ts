@@ -81,6 +81,35 @@ const sessionHistory = Effect.gen(function*() {
   })
 }).pipe(Effect.orDie)
 
+const startAgentRun = Effect.gen(function*() {
+  const application = yield* Application.Service
+  const params = yield* HttpRouter.params
+  const request = yield* HttpServerRequest.HttpServerRequest
+  const body = yield* Schema.decodeUnknownEffect(Schema.Struct({
+    commitId: Schema.String,
+    agent: Agent.DefinitionSchema,
+    runId: Schema.optional(Schema.String)
+  }))(yield* request.json)
+  const sessionId = params.sessionId
+  if (sessionId === undefined) {
+    return HttpServerResponse.jsonUnsafe(
+      { error: "missing session id" },
+      { status: 400 }
+    )
+  }
+  yield* application.startAgentRun(
+    sessionId,
+    body.commitId,
+    body.agent,
+    body.runId
+  )
+  return HttpServerResponse.jsonUnsafe({
+    sessionId,
+    commitId: body.commitId,
+    runId: body.runId ?? body.commitId
+  }, { status: 202 })
+}).pipe(Effect.orDie)
+
 const checkout = Effect.gen(function*() {
   const application = yield* Application.Service
   const params = yield* HttpRouter.params
@@ -193,6 +222,11 @@ const routes = Layer.mergeAll(
     "/v1/sessions/:sessionId/history",
     sessionHistory
   ),
+  HttpRouter.add(
+    "POST",
+    "/v1/sessions/:sessionId/runs",
+    startAgentRun
+  ),
   HttpRouter.add("POST", "/v1/sessions/:sessionId/head", checkout),
   HttpRouter.add("POST", "/v1/sessions/:sessionId/tree", checkout),
   HttpRouter.add(
@@ -213,11 +247,12 @@ export interface Options {
 }
 
 export const layerWithoutDependencies = ({ host, port }: Options) =>
-  Layer.mergeAll(
-    HttpRouter.serve(routes),
-    AgentRuntime.layerWithoutDependencies
-  ).pipe(
-    Layer.provide(Application.layerWithoutDependencies),
+  HttpRouter.serve(routes).pipe(
+    Layer.provide(
+      Application.layerWithoutDependencies.pipe(
+        Layer.provide(AgentRuntime.layerWithoutDependencies)
+      )
+    ),
     Layer.provide(BunCrypto.layer),
     Layer.provide(BunHttpServer.layer({ hostname: host, port }))
   )

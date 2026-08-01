@@ -238,22 +238,22 @@ class TreePicker implements Component, Focusable {
       const selected = index === this.selected
       const cursor = selected ? cyan("›") : " "
       const marker = item.current ? green("◆") : item.active ? cyan("●") : dim("○")
-      const [role, rawContent] = item.record.type === "UserCommit"
-        ? [cyan("You"), item.record.content]
-        : item.record.type === "AgentMessageCommit"
-        ? [green("Agent"), item.record.content]
-        : item.record.type === "ToolCommit"
-        ? [
-          dim(`Tool Commit · ${item.record.name}`),
+      const [role, rawContent] = Session.foldBranchRecord(item.record, {
+        user: (record) => [cyan("You"), record.content] as const,
+        agentMessage: (record) => [green("Agent"), record.content] as const,
+        failure: (record) => [red("Agent Failure"), record.reason] as const,
+        tool: (record) => [
+          dim(`Tool Commit · ${record.name}`),
           JSON.stringify({
-            input: item.record.input,
-            outcome: item.record.outcome
+            input: record.input,
+            outcome: record.outcome
           })
-        ]
-        : [
-          dim(`Legacy Tool Record · ${item.record.name}`),
-          JSON.stringify({ input: item.record.input, result: "not persisted" })
-        ]
+        ] as const,
+        legacyTool: (record) => [
+          dim(`Legacy Tool Record · ${record.name}`),
+          JSON.stringify({ input: record.input, result: "not persisted" })
+        ] as const
+      })
       const content = (rawContent ?? "").replace(/\s+/g, " ").trim() || "(empty)"
       const line = `  ${cursor} ${marker} ${item.treePrefix}${role}: ${content}`
       lines.push(truncateToWidth(selected ? bold(line) : line, width))
@@ -396,6 +396,12 @@ const make = (
     messages.addChild(new Spacer(1))
   }
 
+  const addFailure = (reason: string) => {
+    messages.addChild(new Text(bold(red("Agent Failure")), 1, 0))
+    messages.addChild(new Text(red(reason), 1, 1))
+    messages.addChild(new Spacer(1))
+  }
+
   const orderedHistory = (): ReadonlyArray<HistoryItem> =>
     [...knownItems.values()].sort((a, b) => a.sequence - b.sequence)
 
@@ -403,12 +409,13 @@ const make = (
     messages.clear()
     const history = orderedHistory()
     for (const record of Session.branchHistory(history, branchHeadId)) {
-      if (record.type === "UserCommit") addUserMessage(record.content)
-      else if (record.type === "AgentMessageCommit") {
-        addAssistantMessage(record.content)
-      } else {
-        addToolRecord(record)
-      }
+      Session.foldBranchRecord(record, {
+        user: (entry) => addUserMessage(entry.content),
+        agentMessage: (entry) => addAssistantMessage(entry.content),
+        failure: (entry) => addFailure(entry.reason),
+        tool: (entry) => addToolRecord(entry),
+        legacyTool: (entry) => addToolRecord(entry)
+      })
     }
 
     const pendingIsCommitted = pending !== undefined && history.some(

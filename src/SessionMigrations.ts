@@ -83,9 +83,42 @@ const addCanonicalCommitsAndLocalHeads = Effect.gen(function*() {
     WHERE event_type = 'AgentMessageCommit'`
 })
 
+const addFailureCommitCausation = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`CREATE UNIQUE INDEX session_events_failure_commit_causation
+    ON session_events(json_extract(payload, '$.inReplyTo'))
+    WHERE event_type = 'FailureCommit'`
+})
+
+/** Allow independent Agent Runs to share one starting Commit. */
+const addAgentRunIdentity = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`DROP INDEX session_events_tool_commit_causation`
+  yield* sql`DROP INDEX session_events_agent_message_causation`
+  yield* sql`DROP INDEX session_events_failure_commit_causation`
+  yield* sql`CREATE UNIQUE INDEX session_events_tool_commit_causation
+    ON session_events(
+      json_extract(payload, '$.inReplyTo'),
+      COALESCE(json_extract(payload, '$.runId'), ''),
+      json_extract(payload, '$.index')
+    ) WHERE event_type = 'ToolCommit'`
+  yield* sql`CREATE UNIQUE INDEX session_events_agent_message_causation
+    ON session_events(
+      json_extract(payload, '$.inReplyTo'),
+      COALESCE(json_extract(payload, '$.runId'), '')
+    ) WHERE event_type = 'AgentMessageCommit'`
+  yield* sql`CREATE UNIQUE INDEX session_events_failure_commit_causation
+    ON session_events(
+      json_extract(payload, '$.inReplyTo'),
+      COALESCE(json_extract(payload, '$.runId'), '')
+    ) WHERE event_type = 'FailureCommit'`
+})
+
 export const loader = SqliteMigrator.fromRecord({
   "1_create_session_events": createSessionEvents,
   "2_create_event_dispatch": createEventDispatch,
   "3_allow_agent_activity_events": allowAgentActivityEvents,
-  "4_add_canonical_commits_and_local_heads": addCanonicalCommitsAndLocalHeads
+  "4_add_canonical_commits_and_local_heads": addCanonicalCommitsAndLocalHeads,
+  "5_add_failure_commit_causation": addFailureCommitCausation,
+  "6_add_agent_run_identity": addAgentRunIdentity
 })

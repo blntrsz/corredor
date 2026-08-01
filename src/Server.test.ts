@@ -77,10 +77,17 @@ it.live(
       )
       const activity = Array.from(yield* Fiber.join(activityFiber))
       const history = yield* proxy.history(session.sessionId)
+      yield* proxy.startAgentRun(
+        session.sessionId,
+        user.commitId,
+        Agent.defaultDefinition,
+        "http-independent-run"
+      )
+      const independentHistory = yield* proxy.history(session.sessionId)
       yield* proxy.checkout(session.sessionId, user.commitId)
       const checkedOut = yield* proxy.history(session.sessionId)
       const sessions = yield* proxy.listSessions()
-      return { user, activity, history, checkedOut, sessions }
+      return { user, activity, history, independentHistory, checkedOut, sessions }
     }).pipe(Effect.provide(layer))
 
     expect(result.user).toMatchObject({
@@ -93,6 +100,25 @@ it.live(
       "ToolCommit",
       "AgentMessageCommit"
     ])
+    expect(result.activity[0]).toMatchObject({
+      type: "UserCommit",
+      commitId: "http-user",
+      parentId: null,
+      content: "Explain Commits"
+    })
+    expect(result.activity[1]).toMatchObject({
+      type: "ToolCommit",
+      parentId: "http-user",
+      name: "Lookup",
+      input: { subject: "Commits" },
+      outcome: { type: "Success", result: { durable: true } }
+    })
+    expect(result.activity[2]).toMatchObject({
+      type: "AgentMessageCommit",
+      parentId: (result.activity[1] as Session.Commit).commitId,
+      inReplyTo: "http-user",
+      content: "Commits are durable."
+    })
     expect(result.history.items).toEqual([
       expect.objectContaining({ type: "SessionCreated" }),
       ...result.activity
@@ -100,8 +126,21 @@ it.live(
     expect(result.history.branchHeadId).toBe(
       Session.branchRecordId(result.activity[2] as Session.BranchRecord)
     )
+    const independentTool = result.independentHistory.items.find(
+      (item) => item.type === "ToolCommit" && item.runId === "http-independent-run"
+    )
+    const independentMessage = result.independentHistory.items.find(
+      (item) => item.type === "AgentMessageCommit" &&
+        item.runId === "http-independent-run"
+    )
+    expect(independentTool).toBeDefined()
+    expect(independentMessage).toMatchObject({
+      inReplyTo: "http-user",
+      runId: "http-independent-run",
+      parentId: (independentTool as Session.Commit).commitId
+    })
     expect(result.checkedOut.branchHeadId).toBe("http-user")
-    expect(result.checkedOut.items).toEqual(result.history.items)
+    expect(result.checkedOut.items).toEqual(result.independentHistory.items)
     expect(result.sessions).toEqual([
       expect.objectContaining({
         sessionId: "http-session",

@@ -2,8 +2,10 @@ import { Context, Effect, Layer, Schedule, Schema, Stream } from "effect"
 import {
   FetchHttpClient,
   HttpClient,
-  HttpClientRequest
+  HttpClientRequest,
+  HttpClientResponse
 } from "effect/unstable/http"
+import { Agent } from "./Agent.ts"
 import * as Session from "./Session.ts"
 
 export class ProxyError extends Schema.TaggedErrorClass<ProxyError>()(
@@ -23,6 +25,12 @@ export interface Interface {
     Extract<Session.Commit, { readonly type: "UserCommit" }>,
     ProxyError
   >
+  readonly startAgentRun: (
+    sessionId: string,
+    startingCommitId: string,
+    definition: Agent.Definition,
+    runId?: string
+  ) => Effect.Effect<void, ProxyError>
   readonly listSessions: () => Effect.Effect<
     ReadonlyArray<Session.SessionSummary>,
     ProxyError
@@ -101,20 +109,27 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
   const execute = (request: HttpClientRequest.HttpClientRequest) =>
     client.execute(request).pipe(Effect.mapError(proxyError))
 
-  const responseJson = Effect.fn("AgentProxy.responseJson")(function*(
-    request: HttpClientRequest.HttpClientRequest
+  const requireSuccess = Effect.fn("AgentProxy.requireSuccess")(function*(
+    response: HttpClientResponse.HttpClientResponse,
+    operation = "Corredor API"
   ) {
-    const response = yield* execute(request)
     if (response.status < 200 || response.status >= 300) {
       const detail = yield* response.text.pipe(
         Effect.catch(() => Effect.succeed(""))
       )
       return yield* new ProxyError({
-        message: `Corredor API returned ${response.status}${
+        message: `${operation} returned ${response.status}${
           detail.length > 0 ? `: ${detail}` : ""
         }`
       })
     }
+    return response
+  })
+
+  const responseJson = Effect.fn("AgentProxy.responseJson")(function*(
+    request: HttpClientRequest.HttpClientRequest
+  ) {
+    const response = yield* requireSuccess(yield* execute(request))
     return yield* response.json.pipe(Effect.mapError(proxyError))
   })
 
@@ -125,13 +140,7 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
           `/v1/sessions/${encodeURIComponent(sessionId)}/activity?after=${after}`
         )
       ).pipe(HttpClientRequest.accept("text/event-stream"))
-      const response = yield* execute(request)
-      if (response.status < 200 || response.status >= 300) {
-        return yield* new ProxyError({
-          message: `Activity stream returned ${response.status}`
-        })
-      }
-      return response
+      return yield* requireSuccess(yield* execute(request), "Activity stream")
     }
   )
 
@@ -164,6 +173,22 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
         >
       }
     ),
+    startAgentRun: Effect.fn("AgentProxy.startAgentRun")(
+      function*(
+        sessionId: string,
+        startingCommitId: string,
+        definition: Agent.Definition,
+        runId?: string
+      ) {
+        yield* responseJson(HttpClientRequest.post(
+          url(`/v1/sessions/${encodeURIComponent(sessionId)}/runs`)
+        ).pipe(HttpClientRequest.bodyJsonUnsafe({
+          commitId: startingCommitId,
+          agent: definition,
+          ...(runId === undefined ? {} : { runId })
+        })))
+      }
+    ),
     listSessions: Effect.fn("AgentProxy.listSessions")(function*() {
       const body = yield* responseJson(
         HttpClientRequest.get(url("/v1/sessions"))
@@ -184,19 +209,9 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
       sessionId: string,
       commitId: string | null
     ) {
-      const response = yield* execute(HttpClientRequest.post(
+      yield* requireSuccess(yield* execute(HttpClientRequest.post(
         url(`/v1/sessions/${encodeURIComponent(sessionId)}/head`)
-      ).pipe(HttpClientRequest.bodyJsonUnsafe({ commitId })))
-      if (response.status < 200 || response.status >= 300) {
-        const detail = yield* response.text.pipe(
-          Effect.catch(() => Effect.succeed(""))
-        )
-        return yield* new ProxyError({
-          message: `Corredor API returned ${response.status}${
-            detail.length > 0 ? `: ${detail}` : ""
-          }`
-        })
-      }
+      ).pipe(HttpClientRequest.bodyJsonUnsafe({ commitId }))))
     }),
     streamActivity: (sessionId, after = 0) => {
       let cursor = after

@@ -14,6 +14,27 @@ export namespace Agent {
     "When you have enough information, respond with a final answer without calling another tool."
   ].join(" ")
 
+  export type ToolName = "Bash"
+
+  /** Serializable configuration selecting the Agent's behavior and tools. */
+  export interface Definition {
+    readonly id: string
+    readonly instructions: string
+    readonly tools: ReadonlyArray<ToolName>
+  }
+
+  export const DefinitionSchema = Schema.Struct({
+    id: Schema.String,
+    instructions: Schema.String,
+    tools: Schema.Array(Schema.Literal("Bash"))
+  })
+
+  export const defaultDefinition: Definition = {
+    id: "default",
+    instructions: systemPrompt,
+    tools: ["Bash"]
+  }
+
   export class BashError extends Schema.TaggedErrorClass<BashError>()(
     "@corredor/Agent/BashError",
     { message: Schema.String }
@@ -114,6 +135,11 @@ export namespace Agent {
         readonly value: unknown
       }
     }
+    | {
+      readonly type: "Failure"
+      readonly commitId: string
+      readonly reason: string
+    }
 
   export interface Interface {
     /**
@@ -122,7 +148,8 @@ export namespace Agent {
      */
     readonly run: <E = never, R = never>(
       context: ReadonlyArray<ContextEntry>,
-      onEvent: (event: Event) => Effect.Effect<void, E, R>
+      onEvent: (event: Event) => Effect.Effect<void, E, R>,
+      definition?: Definition
     ) => Effect.Effect<string, Error | E, R>
   }
 
@@ -137,7 +164,8 @@ export namespace Agent {
     const run: Interface["run"] = Effect.fn("Agent.run")(
       function*<E = never, R = never>(
         context: ReadonlyArray<ContextEntry>,
-        onEvent: (event: Event) => Effect.Effect<void, E, R>
+        onEvent: (event: Event) => Effect.Effect<void, E, R>,
+        definition = defaultDefinition
       ) {
         const latest = context.at(-1)
         const resumingAfterTool = latest?.type === "Tool"
@@ -156,6 +184,12 @@ export namespace Agent {
           if (entry.type === "AgentMessage") {
             return { role: "assistant" as const, content: entry.content }
           }
+          if (entry.type === "Failure") {
+            return {
+              role: "assistant" as const,
+              content: `[Previous Agent Run failed: ${entry.reason}]`
+            }
+          }
           const outcome = entry.outcome.type === "Success"
             ? { result: entry.outcome.value }
             : { failure: entry.outcome.value }
@@ -168,7 +202,7 @@ export namespace Agent {
           }
         })
         const chat = yield* Chat.fromPrompt([
-          { role: "system", content: systemPrompt },
+          { role: "system", content: definition.instructions },
           ...history
         ])
 

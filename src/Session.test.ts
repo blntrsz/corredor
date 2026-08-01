@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest"
+import * as AgentRuntime from "./AgentRuntime.ts"
 import {
   branchHistory,
   commitGraph,
@@ -144,4 +145,23 @@ describe("Commit graph", () => {
     expect(commitGraph(history).headId).toBe("u2")
     expect(commitGraph(history).nodes).toHaveLength(3)
   })
+})
+
+it("does not replay legacy projected User Commits", () => {
+  const legacy = commit(1, {
+    type: "UserCommit",
+    commitId: "legacy-user",
+    parentId: null,
+    content: "old request",
+    legacyMessageId: "old-message"
+  })
+  const canonical = commit(2, {
+    type: "UserCommit",
+    commitId: "new-user",
+    parentId: "legacy-user",
+    content: "new request"
+  })
+
+  expect(AgentRuntime.isRunnableUserCommit(legacy)).toBe(false)
+  expect(AgentRuntime.isRunnableUserCommit(canonical)).toBe(true)
 })

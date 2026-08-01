@@ -37,13 +37,21 @@ export type Commit =
     readonly input: unknown
     readonly outcome: ToolOutcome
     readonly inReplyTo: string
+    readonly runId?: string
     readonly index: number
   }
   | CommitMetadata & {
     readonly type: "AgentMessageCommit"
     readonly content: string
     readonly inReplyTo: string
+    readonly runId?: string
     readonly legacyMessageId?: string
+  }
+  | CommitMetadata & {
+    readonly type: "FailureCommit"
+    readonly reason: string
+    readonly inReplyTo: string
+    readonly runId?: string
   }
 
 export interface LegacyToolCall {
@@ -82,6 +90,31 @@ export interface LegacyNavigation {
 
 export type HistoryItem = Commit | LegacyToolCall | SessionCreated | LegacyNavigation
 export type BranchRecord = Commit | LegacyToolCall
+
+type UserCommit = Extract<Commit, { readonly type: "UserCommit" }>
+type AgentMessageCommit = Extract<Commit, { readonly type: "AgentMessageCommit" }>
+type FailureCommit = Extract<Commit, { readonly type: "FailureCommit" }>
+type ToolCommit = Extract<Commit, { readonly type: "ToolCommit" }>
+
+export interface BranchRecordHandlers<A> {
+  readonly user: (record: UserCommit) => A
+  readonly agentMessage: (record: AgentMessageCommit) => A
+  readonly failure: (record: FailureCommit) => A
+  readonly tool: (record: ToolCommit) => A
+  readonly legacyTool: (record: LegacyToolCall) => A
+}
+
+/** Centralizes Branch-record dispatch for runtime and presentation consumers. */
+export const foldBranchRecord = <A>(
+  record: BranchRecord,
+  handlers: BranchRecordHandlers<A>
+): A => {
+  if (record.type === "UserCommit") return handlers.user(record)
+  if (record.type === "AgentMessageCommit") return handlers.agentMessage(record)
+  if (record.type === "FailureCommit") return handlers.failure(record)
+  if (record.type === "ToolCommit") return handlers.tool(record)
+  return handlers.legacyTool(record)
+}
 
 export interface HistorySnapshot {
   readonly items: ReadonlyArray<HistoryItem>
@@ -127,6 +160,7 @@ const ToolCommitSchema = Schema.Struct({
   input: Schema.Unknown,
   outcome: ToolOutcomeSchema,
   inReplyTo: Schema.String,
+  runId: Schema.optional(Schema.String),
   index: Schema.Number
 })
 
@@ -135,7 +169,16 @@ const AgentMessageCommitSchema = Schema.Struct({
   type: Schema.Literal("AgentMessageCommit"),
   content: Schema.String,
   inReplyTo: Schema.String,
+  runId: Schema.optional(Schema.String),
   legacyMessageId: Schema.optional(Schema.String)
+})
+
+const FailureCommitSchema = Schema.Struct({
+  ...commitMetadata,
+  type: Schema.Literal("FailureCommit"),
+  reason: Schema.String,
+  inReplyTo: Schema.String,
+  runId: Schema.optional(Schema.String)
 })
 
 export const SessionCreatedSchema = Schema.Struct({
@@ -150,6 +193,7 @@ export const HistoryItemSchema = Schema.Union([
   UserCommitSchema,
   ToolCommitSchema,
   AgentMessageCommitSchema,
+  FailureCommitSchema,
   Schema.Struct({
     ...historyMetadata,
     type: Schema.Literal("LegacyToolCall"),
@@ -175,7 +219,8 @@ export const HistoryItemSchema = Schema.Union([
 export const CommitSchema = Schema.Union([
   UserCommitSchema,
   ToolCommitSchema,
-  AgentMessageCommitSchema
+  AgentMessageCommitSchema,
+  FailureCommitSchema
 ])
 
 export const HistorySnapshotSchema = Schema.Struct({
@@ -233,7 +278,8 @@ export const SessionSummarySchema = Schema.Struct({
 export const isCommit = (item: HistoryItem): item is Commit =>
   item.type === "UserCommit" ||
   item.type === "ToolCommit" ||
-  item.type === "AgentMessageCommit"
+  item.type === "AgentMessageCommit" ||
+  item.type === "FailureCommit"
 
 export const isBranchRecord = (item: HistoryItem): item is BranchRecord =>
   isCommit(item) || item.type === "LegacyToolCall"
@@ -333,13 +379,21 @@ export interface Interface {
     input: unknown,
     outcome: ToolOutcome,
     inReplyTo: string,
-    index: number
+    index: number,
+    runId?: string
   ) => Effect.Effect<Extract<Commit, { readonly type: "ToolCommit" }>, Error>
   readonly appendAgentMessageCommit: (
     sessionId: string,
     content: string,
-    inReplyTo: string
+    inReplyTo: string,
+    runId?: string
   ) => Effect.Effect<Extract<Commit, { readonly type: "AgentMessageCommit" }>, Error>
+  readonly appendFailureCommit: (
+    sessionId: string,
+    reason: string,
+    inReplyTo: string,
+    runId?: string
+  ) => Effect.Effect<Extract<Commit, { readonly type: "FailureCommit" }>, Error>
   readonly checkout: (sessionId: string, commitId: string | null) => Effect.Effect<void, Error>
   readonly history: (sessionId: string) => Effect.Effect<HistorySnapshot, PersistenceError>
   readonly listSessions: () => Effect.Effect<ReadonlyArray<SessionSummary>, PersistenceError>
@@ -354,6 +408,7 @@ type RawEventType =
   | "UserCommit"
   | "ToolCommit"
   | "AgentMessageCommit"
+  | "FailureCommit"
   | "UserMessageAdded"
   | "AgentToolCallAdded"
   | "AgentMessageAdded"
@@ -443,10 +498,27 @@ const decodeHistory = (rows: ReadonlyArray<EventRow>): ReadonlyArray<HistoryItem
         createdAt,
         content: String(payload.content ?? ""),
         inReplyTo: String(payload.inReplyTo ?? parentId ?? ""),
+        ...(typeof payload.runId === "string" ? { runId: payload.runId } : {}),
         ...(row.event_type === "AgentMessageAdded" &&
           typeof payload.messageId === "string"
           ? { legacyMessageId: payload.messageId }
           : {})
+      }
+      items.push(commit)
+      if (parentId === currentHead) heads.set(row.session_id, commit.commitId)
+      continue
+    }
+
+    if (row.event_type === "FailureCommit") {
+      const commit: Commit = {
+        ...metadata,
+        type: "FailureCommit",
+        commitId: row.event_id,
+        parentId,
+        createdAt,
+        reason: String(payload.reason ?? "Agent run failed"),
+        inReplyTo: String(payload.inReplyTo ?? ""),
+        ...(typeof payload.runId === "string" ? { runId: payload.runId } : {})
       }
       items.push(commit)
       if (parentId === currentHead) heads.set(row.session_id, commit.commitId)
@@ -469,6 +541,7 @@ const decodeHistory = (rows: ReadonlyArray<EventRow>): ReadonlyArray<HistoryItem
         input: payload.input,
         outcome,
         inReplyTo: String(payload.inReplyTo ?? ""),
+        ...(typeof payload.runId === "string" ? { runId: payload.runId } : {}),
         index: Number(payload.index ?? 0)
       }
       items.push(commit)
@@ -561,7 +634,8 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
 
   const responseParent = (
     history: ReadonlyArray<HistoryItem>,
-    inReplyTo: string
+    inReplyTo: string,
+    runId?: string
   ): string => {
     const toolEntries = history.filter(
       (item): item is Extract<
@@ -569,10 +643,53 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         { readonly type: "ToolCommit" | "LegacyToolCall" }
       > =>
         (item.type === "ToolCommit" || item.type === "LegacyToolCall") &&
-        item.inReplyTo === inReplyTo
+        item.inReplyTo === inReplyTo &&
+        (item.type === "LegacyToolCall"
+          ? runId === undefined
+          : item.runId === runId)
     )
     return toolEntries.map(branchRecordId).at(-1) ?? inReplyTo
   }
+
+  type ResponseCommitType = "AgentMessageCommit" | "FailureCommit"
+  type ResponseCommitResult =
+    | { readonly type: "NotFound" }
+    | { readonly type: "CommitNotFound"; readonly commitId: string }
+    | { readonly type: "Appended"; readonly item: Commit }
+
+  const appendResponseCommit = (
+    sessionId: string,
+    eventType: ResponseCommitType,
+    inReplyTo: string,
+    runId: string | undefined,
+    payload: Record<string, unknown>,
+    matchesExisting: (item: HistoryItem) => boolean
+  ): Effect.Effect<ResponseCommitResult, PersistenceError> => Effect.gen(function*() {
+    const rows = yield* sessionRows(sessionId)
+    if (rows.length === 0) return { type: "NotFound" as const }
+    const history = decodeHistory(rows)
+    const existing = history.find(matchesExisting)
+    if (existing !== undefined) {
+      return { type: "Appended" as const, item: existing as Commit }
+    }
+    if (!history.some(
+      (item) => isBranchRecord(item) &&
+        branchRecordId(item) === inReplyTo
+    )) {
+      return { type: "CommitNotFound" as const, commitId: inReplyTo }
+    }
+    const parentId = responseParent(history, inReplyTo, runId)
+    const commitId = yield* randomId
+    const item = yield* insert(
+      sessionId,
+      commitId,
+      eventType,
+      { ...payload, parentId, runId },
+      rows.at(-1)!.sequence + 1
+    )
+    yield* updateHeadIfCurrent(sessionId, parentId, commitId)
+    return { type: "Appended" as const, item: item as Commit }
+  }).pipe(sql.withTransaction, persist)
 
   return Service.of({
     check: sql`SELECT 1`.pipe(Effect.asVoid, persist),
@@ -627,7 +744,8 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       input,
       outcome,
       inReplyTo,
-      index
+      index,
+      runId
     ) {
       const result = yield* Effect.gen(function*() {
         const rows = yield* sessionRows(sessionId)
@@ -637,6 +755,7 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
           (item): item is Extract<Commit, { readonly type: "ToolCommit" }> =>
             item.type === "ToolCommit" &&
             item.inReplyTo === inReplyTo &&
+            item.runId === runId &&
             item.index === index
         )
         if (existing !== undefined) {
@@ -655,13 +774,13 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         )) {
           return { type: "CommitNotFound" as const, commitId: inReplyTo }
         }
-        const parentId = responseParent(history, inReplyTo)
+        const parentId = responseParent(history, inReplyTo, runId)
         const commitId = yield* randomId
         const item = yield* insert(
           sessionId,
           commitId,
           "ToolCommit",
-          { toolCallId, name, input, outcome, inReplyTo, index, parentId },
+          { toolCallId, name, input, outcome, inReplyTo, index, parentId, runId },
           rows.at(-1)!.sequence + 1
         )
         yield* updateHeadIfCurrent(sessionId, parentId, commitId)
@@ -677,39 +796,17 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       return result.item as Extract<Commit, { readonly type: "ToolCommit" }>
     }),
     appendAgentMessageCommit: Effect.fn("Session.appendAgentMessageCommit")(
-      function*(sessionId, content, inReplyTo) {
-        const result = yield* Effect.gen(function*() {
-          const rows = yield* sessionRows(sessionId)
-          if (rows.length === 0) return { type: "NotFound" as const }
-          const history = decodeHistory(rows)
-          const existing = history.find((item) =>
-            item.type === "AgentMessageCommit" &&
-            item.inReplyTo === inReplyTo
-          )
-          if (existing !== undefined) {
-            return { type: "Appended" as const, item: existing }
-          }
-          if (!history.some(
-            (item) => isBranchRecord(item) &&
-              branchRecordId(item) === inReplyTo
-          )) {
-            return { type: "CommitNotFound" as const, commitId: inReplyTo }
-          }
-          const parentId = responseParent(history, inReplyTo)
-          const commitId = yield* randomId
-          const item = yield* insert(
-            sessionId,
-            commitId,
-            "AgentMessageCommit",
-            { content, inReplyTo, parentId },
-            rows.at(-1)!.sequence + 1
-          )
-          yield* updateHeadIfCurrent(sessionId, parentId, commitId)
-          return {
-            type: "Appended" as const,
-            item: item as Extract<Commit, { type: "AgentMessageCommit" }>
-          }
-        }).pipe(sql.withTransaction, persist)
+      function*(sessionId, content, inReplyTo, runId) {
+        const result = yield* appendResponseCommit(
+          sessionId,
+          "AgentMessageCommit",
+          inReplyTo,
+          runId,
+          { content, inReplyTo },
+          (item) => item.type === "AgentMessageCommit" &&
+            item.inReplyTo === inReplyTo &&
+            item.runId === runId
+        )
         if (result.type === "NotFound") {
           return yield* new NotFound({ sessionId })
         }
@@ -722,6 +819,33 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         return result.item as Extract<
           Commit,
           { readonly type: "AgentMessageCommit" }
+        >
+      }
+    ),
+    appendFailureCommit: Effect.fn("Session.appendFailureCommit")(
+      function*(sessionId, reason, inReplyTo, runId) {
+        const result = yield* appendResponseCommit(
+          sessionId,
+          "FailureCommit",
+          inReplyTo,
+          runId,
+          { reason, inReplyTo },
+          (item) => item.type === "FailureCommit" &&
+            item.inReplyTo === inReplyTo &&
+            item.runId === runId
+        )
+        if (result.type === "NotFound") {
+          return yield* new NotFound({ sessionId })
+        }
+        if (result.type === "CommitNotFound") {
+          return yield* new CommitNotFound({
+            sessionId,
+            commitId: result.commitId
+          })
+        }
+        return result.item as Extract<
+          Commit,
+          { readonly type: "FailureCommit" }
         >
       }
     ),
