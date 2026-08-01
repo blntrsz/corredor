@@ -59,6 +59,14 @@ export interface Interface {
     Extract<Session.Commit, { readonly type: "CompactionCommit" }>,
     ProxyError
   >
+  readonly cherryPick: (
+    sourceSessionId: string,
+    sourceCommitId: string,
+    targetSessionId: string
+  ) => Effect.Effect<
+    Extract<Session.Commit, { readonly type: "AgentMessageCommit" }>,
+    ProxyError
+  >
   readonly interruptAgentRun: (
     sessionId: string,
     startingCommitId: string,
@@ -326,6 +334,26 @@ export const make = (
         return decoded.commit
       }
     ),
+    cherryPick: Effect.fn("AgentProxy.cherryPick")(function*(
+      sourceSessionId: string,
+      sourceCommitId: string,
+      targetSessionId: string
+    ) {
+      const body = yield* responseJson(withPeer(HttpClientRequest.post(
+        url(`/v1/sessions/${encodeURIComponent(targetSessionId)}/cherry-pick`)
+      ).pipe(HttpClientRequest.bodyJsonUnsafe({
+        sourceSessionId,
+        sourceCommitId
+      }))))
+      const decoded = yield* Schema.decodeUnknownEffect(CommitResponse)(body)
+        .pipe(Effect.mapError(proxyError))
+      if (decoded.commit.type !== "AgentMessageCommit") {
+        return yield* new ProxyError({
+          message: "Cherry-pick API returned a non-Agent Message Commit"
+        })
+      }
+      return decoded.commit
+    }),
     interruptAgentRun: Effect.fn("AgentProxy.interruptAgentRun")(
       function*(
         sessionId: string,

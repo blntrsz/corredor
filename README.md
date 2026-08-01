@@ -66,6 +66,13 @@ curl -X POST http://127.0.0.1:5050/v1/sessions/$SESSION_ID/compact \
   -H 'content-type: application/json' \
   -d '{"commitId":"COMMIT_ID","agent":{"id":"compactor","instructions":"Summarize the Branch.","tools":[]}}'
 
+# Cherry-pick an Agent Message Commit or Compaction Commit onto another
+# Session's local Branch Head. The copied Commit remains an Agent Message
+# Commit with provenance.
+curl -X POST http://127.0.0.1:5050/v1/sessions/$TARGET_SESSION_ID/cherry-pick \
+  -H 'content-type: application/json' \
+  -d '{"sourceSessionId":"SOURCE_SESSION_ID","sourceCommitId":"COMMIT_ID"}'
+
 # Interrupt the active Agent Run. The response contains the durable outcome.
 curl -X POST http://127.0.0.1:5050/v1/sessions/$SESSION_ID/interrupt \
   -H 'content-type: application/json' \
@@ -117,6 +124,11 @@ Use `/compact` in the interactive client to summarize the current Branch. A
 Compaction Commit points to the selected Branch Head, keeps the earlier
 Commits visible in history, and becomes the only representation of that older
 ancestry in later Agent context.
+
+Cherry-pick copies an Agent Message Commit or Compaction Commit into the target
+Session as an Agent Message Commit whose `provenance` identifies the source
+Workstream, Session, and Commit. It never starts an Agent Run or deduplicates
+repeated picks.
 
 Workstreams group related Sessions. Create one explicitly, or omit
 `workstreamId` when creating a Session to use the migration-safe default

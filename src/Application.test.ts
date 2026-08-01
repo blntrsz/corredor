@@ -1096,6 +1096,333 @@ it.live(
 )
 
 it.live(
+  "cherry-picks an Agent Message onto a same-Session Branch with provenance",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-cherry-pick-")
+    let agentRuns = 0
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: () => Effect.sync(() => {
+        agentRuns += 1
+        return "source Agent Message"
+      })
+    }))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const session = yield* application.createSession("cherry-pick-session")
+      const user = yield* application.submitUserCommit(
+        session.sessionId,
+        "Create source context",
+        "cherry-pick-user"
+      )
+
+      let history = yield* application.history(session.sessionId)
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (history.items.some((item) => item.type === "AgentMessageCommit")) break
+        yield* Effect.sleep("10 millis")
+        history = yield* application.history(session.sessionId)
+      }
+      const source = history.items.find(
+        (item): item is Extract<Session.Commit, { readonly type: "AgentMessageCommit" }> =>
+          item.type === "AgentMessageCommit"
+      )
+      if (source === undefined) {
+        return yield* Effect.die("timed out waiting for source Agent Message")
+      }
+
+      yield* application.checkout(session.sessionId, user.commitId, "target-peer")
+      const first = yield* application.cherryPick(
+        session.sessionId,
+        source.commitId,
+        session.sessionId,
+        "target-peer"
+      )
+      const second = yield* application.cherryPick(
+        session.sessionId,
+        source.commitId,
+        session.sessionId,
+        "target-peer"
+      )
+      const sourceHistory = yield* application.history(
+        session.sessionId,
+        Session.defaultPeerId
+      )
+      const targetHistory = yield* application.history(
+        session.sessionId,
+        "target-peer"
+      )
+      return { source, first, second, sourceHistory, targetHistory }
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    expect(result.first).toMatchObject({
+      type: "AgentMessageCommit",
+      parentId: "cherry-pick-user",
+      content: "source Agent Message",
+      provenance: {
+        workstreamId: Session.defaultWorkstreamId,
+        sessionId: "cherry-pick-session",
+        commitId: result.source.commitId
+      }
+    })
+    expect(result.second.commitId).not.toBe(result.first.commitId)
+    expect(result.second.parentId).toBe(result.first.commitId)
+    expect(result.targetHistory.branchHeadId).toBe(result.second.commitId)
+    expect(result.sourceHistory.branchHeadId).toBe(result.source.commitId)
+    expect(agentRuns).toBe(1)
+  })
+)
+
+it.live(
+  "cherry-picks a Compaction across Sessions as target context without compacting it",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-cherry-compaction-")
+    const contexts: Array<ReadonlyArray<Agent.ContextEntry>> = []
+    let agentRuns = 0
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (context, _onEvent, definition) => Effect.sync(() => {
+        contexts.push(context)
+        agentRuns += 1
+        return definition?.id === "compactor"
+          ? "source Compaction summary"
+          : "source Agent Message"
+      })
+    }))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const workstream = yield* application.createWorkstream(
+        "cherry-source-workstream",
+        "Cherry Source"
+      )
+      const sourceSession = yield* application.createSession(
+        "cherry-compaction-source",
+        workstream.workstreamId
+      )
+      yield* application.submitUserCommit(
+        sourceSession.sessionId,
+        "Build source context",
+        "cherry-compaction-user"
+      )
+
+      let sourceHistory = yield* application.history(sourceSession.sessionId)
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (sourceHistory.items.some((item) => item.type === "AgentMessageCommit")) break
+        yield* Effect.sleep("10 millis")
+        sourceHistory = yield* application.history(sourceSession.sessionId)
+      }
+      const sourceHeadId = sourceHistory.branchHeadId
+      if (sourceHeadId === null) {
+        return yield* Effect.die("timed out waiting for source Branch Head")
+      }
+      const compaction = yield* application.compact(
+        sourceSession.sessionId,
+        sourceHeadId,
+        {
+          id: "compactor",
+          instructions: "Summarize the source Branch.",
+          tools: []
+        },
+        "cherry-compaction-run"
+      )
+      const targetSession = yield* application.createSession("cherry-compaction-target")
+      const runsBeforePick = agentRuns
+      const picked = yield* application.cherryPick(
+        sourceSession.sessionId,
+        compaction.commitId,
+        targetSession.sessionId,
+        "cherry-target-peer"
+      )
+      const targetAfterPick = yield* application.history(
+        targetSession.sessionId,
+        "cherry-target-peer"
+      )
+      yield* application.submitUserCommit(
+        targetSession.sessionId,
+        "Continue with the imported summary",
+        "cherry-target-user",
+        "cherry-target-peer"
+      )
+      let targetAfterRun = targetAfterPick
+      for (let attempt = 0; attempt < 100; attempt++) {
+        targetAfterRun = yield* application.history(
+          targetSession.sessionId,
+          "cherry-target-peer"
+        )
+        if (targetAfterRun.items.some(
+          (item) => item.type === "AgentMessageCommit" &&
+            item.inReplyTo === "cherry-target-user"
+        )) break
+        yield* Effect.sleep("10 millis")
+      }
+      return {
+        sourceSession,
+        compaction,
+        picked,
+        targetAfterPick,
+        targetAfterRun,
+        runsBeforePick
+      }
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    expect(result.picked).toMatchObject({
+      type: "AgentMessageCommit",
+      parentId: null,
+      content: "source Compaction summary",
+      provenance: {
+        workstreamId: "cherry-source-workstream",
+        sessionId: result.sourceSession.sessionId,
+        commitId: result.compaction.commitId
+      }
+    })
+    expect(result.targetAfterPick.branchHeadId).toBe(result.picked.commitId)
+    expect(result.targetAfterPick.items.some(
+      (item) => item.type === "CompactionCommit"
+    )).toBe(false)
+    expect(result.runsBeforePick).toBe(2)
+    expect(result.targetAfterRun.items.map((item) => item.type)).toEqual([
+      "SessionCreated",
+      "AgentMessageCommit",
+      "UserCommit",
+      "AgentMessageCommit"
+    ])
+    expect(contexts.at(-1)?.map((entry) => entry.type)).toEqual([
+      "AgentMessage",
+      "User"
+    ])
+  })
+)
+
+it.live(
+  "rejects User, Tool, Interrupt, and Failure Commits as Cherry-pick sources",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-cherry-rejections-")
+    let markInterruptStarted!: () => void
+    const interruptStarted = new Promise<void>((resolve) => {
+      markInterruptStarted = resolve
+    })
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (context, onEvent, definition) => {
+        if (definition?.id === "tool") {
+          return Effect.gen(function*() {
+            yield* onEvent({
+              type: "ToolCall",
+              id: "cherry-tool-call",
+              name: "Lookup",
+              input: { query: "source" }
+            })
+            yield* onEvent({
+              type: "ToolResult",
+              id: "cherry-tool-call",
+              name: "Lookup",
+              result: { found: true },
+              isFailure: false
+            })
+            return "tool response"
+          })
+        }
+        if (definition?.id === "failure") {
+          return Effect.die(new Error("source run failed"))
+        }
+        if (context.some(
+          (entry) => entry.type === "User" && entry.content === "Interrupt me"
+        )) {
+          return Effect.gen(function*() {
+            yield* onEvent({ type: "TextDelta", text: "partial source" })
+            markInterruptStarted()
+            yield* Effect.promise(() => new Promise<void>(() => undefined))
+            return "unreachable"
+          })
+        }
+        return Effect.succeed("normal source response")
+      }
+    }))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const sourceSession = yield* application.createSession("cherry-rejection-source")
+      const user = yield* application.submitUserCommit(
+        sourceSession.sessionId,
+        "Create a source root",
+        "cherry-rejection-user"
+      )
+
+      let history = yield* application.history(sourceSession.sessionId)
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (history.items.some((item) => item.type === "AgentMessageCommit")) break
+        yield* Effect.sleep("10 millis")
+        history = yield* application.history(sourceSession.sessionId)
+      }
+      yield* application.startAgentRun(
+        sourceSession.sessionId,
+        user.commitId,
+        { id: "tool", instructions: "Use a tool.", tools: [] },
+        "cherry-tool-run"
+      )
+      let tool = (yield* application.history(sourceSession.sessionId)).items.find(
+        (item): item is Extract<Session.Commit, { readonly type: "ToolCommit" }> =>
+          item.type === "ToolCommit" && item.runId === "cherry-tool-run"
+      )
+      for (let attempt = 0; attempt < 100 && tool === undefined; attempt++) {
+        yield* Effect.sleep("10 millis")
+        tool = (yield* application.history(sourceSession.sessionId)).items.find(
+          (item): item is Extract<Session.Commit, { readonly type: "ToolCommit" }> =>
+            item.type === "ToolCommit" && item.runId === "cherry-tool-run"
+        )
+      }
+
+      yield* application.startAgentRun(
+        sourceSession.sessionId,
+        user.commitId,
+        { id: "failure", instructions: "Fail.", tools: [] },
+        "cherry-failure-run"
+      )
+      let failure = (yield* application.history(sourceSession.sessionId)).items.find(
+        (item): item is Extract<Session.Commit, { readonly type: "FailureCommit" }> =>
+          item.type === "FailureCommit" && item.runId === "cherry-failure-run"
+      )
+      for (let attempt = 0; attempt < 100 && failure === undefined; attempt++) {
+        yield* Effect.sleep("10 millis")
+        failure = (yield* application.history(sourceSession.sessionId)).items.find(
+          (item): item is Extract<Session.Commit, { readonly type: "FailureCommit" }> =>
+            item.type === "FailureCommit" && item.runId === "cherry-failure-run"
+        )
+      }
+
+      const interruptUser = yield* application.submitUserCommit(
+        sourceSession.sessionId,
+        "Interrupt me",
+        "cherry-interrupt-user"
+      )
+      yield* Effect.promise(() => interruptStarted)
+      const interrupt = yield* application.interruptAgentRun(
+        sourceSession.sessionId,
+        interruptUser.commitId
+      )
+      const targetSession = yield* application.createSession("cherry-rejection-target")
+      const rejected = []
+      for (const sourceCommitId of [
+        user.commitId,
+        tool?.commitId,
+        failure?.commitId,
+        interrupt?.commitId
+      ]) {
+        if (sourceCommitId === undefined) continue
+        rejected.push(yield* Effect.flip(application.cherryPick(
+          sourceSession.sessionId,
+          sourceCommitId,
+          targetSession.sessionId
+        )))
+      }
+      return { rejected, tool, failure, interrupt }
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    expect(result.rejected).toHaveLength(4)
+    expect(result.rejected.every((error) => error instanceof Session.CommitNotFound))
+      .toBe(true)
+  })
+)
+
+it.live(
   "records a durable Failure Commit when compaction fails",
   () => Effect.gen(function*() {
     const { path } = yield* temporaryDatabase("corredor-compaction-failure-")

@@ -68,6 +68,15 @@ export interface Interface {
     Extract<Session.Commit, { readonly type: "InterruptCommit" }> | undefined,
     Session.Error | Session.PersistenceError
   >
+  readonly cherryPick: (
+    sourceSessionId: string,
+    sourceCommitId: string,
+    targetSessionId: string,
+    targetPeerId?: string
+  ) => Effect.Effect<
+    Extract<Session.Commit, { readonly type: "AgentMessageCommit" }>,
+    Session.Error
+  >
   readonly checkout: (
     sessionId: string,
     commitId: string | null,
@@ -202,6 +211,19 @@ export const make = Effect.gen(function*() {
         )
       }
     ),
+    cherryPick: Effect.fn("Application.cherryPick")(function*(
+      sourceSessionId: string,
+      sourceCommitId: string,
+      targetSessionId: string,
+      targetPeerId?: string
+    ) {
+      return yield* store.cherryPick(
+        sourceSessionId,
+        sourceCommitId,
+        targetSessionId,
+        targetPeerId
+      )
+    }),
     checkout: Effect.fn("Application.checkout")(
       function*(sessionId: string, commitId: string | null, peerId?: string) {
         yield* store.checkout(sessionId, commitId, peerId)

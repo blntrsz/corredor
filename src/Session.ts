@@ -24,6 +24,13 @@ interface CommitMetadata {
   readonly createdAt: string
 }
 
+/** Identifies the Commit copied by a Cherry-pick operation. */
+export interface CommitProvenance {
+  readonly workstreamId: string
+  readonly sessionId: string
+  readonly commitId: string
+}
+
 export type Commit =
   | CommitMetadata & {
     readonly type: "UserCommit"
@@ -47,6 +54,7 @@ export type Commit =
     readonly inReplyTo: string
     readonly runId?: string
     readonly legacyMessageId?: string
+    readonly provenance?: CommitProvenance
   }
   | CommitMetadata & {
     readonly type: "CompactionCommit"
@@ -185,6 +193,12 @@ const commitMetadata = {
   createdAt: Schema.String
 }
 
+const CommitProvenanceSchema = Schema.Struct({
+  workstreamId: Schema.String,
+  sessionId: Schema.String,
+  commitId: Schema.String
+})
+
 const ToolOutcomeSchema = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("Success"),
@@ -222,7 +236,8 @@ const AgentMessageCommitSchema = Schema.Struct({
   content: Schema.String,
   inReplyTo: Schema.String,
   runId: Schema.optional(Schema.String),
-  legacyMessageId: Schema.optional(Schema.String)
+  legacyMessageId: Schema.optional(Schema.String),
+  provenance: Schema.optional(CommitProvenanceSchema)
 })
 
 const CompactionCommitSchema = Schema.Struct({
@@ -613,6 +628,13 @@ export interface Interface {
     runId?: string,
     peerId?: string
   ) => Effect.Effect<Extract<Commit, { readonly type: "InterruptCommit" }>, Error>
+  readonly cherryPick: (
+    /** The canonical order is source Session, source Commit, target Session. */
+    sourceSessionId: string,
+    sourceCommitId: string,
+    targetSessionId: string,
+    targetPeerId?: string
+  ) => Effect.Effect<Extract<Commit, { readonly type: "AgentMessageCommit" }>, Error>
   readonly checkout: (
     sessionId: string,
     commitId: string | null,
@@ -643,6 +665,7 @@ type RawEventType =
   | "UserMessageAdded"
   | "AgentToolCallAdded"
   | "AgentMessageAdded"
+  | "CherryPickedAgentMessage"
   | "SessionTreeNavigated"
   | "SessionSettled"
   | "SessionReopened"
@@ -659,6 +682,20 @@ interface EventRow {
 
 const persistenceError = (cause: unknown) =>
   new PersistenceError({ message: cause instanceof Error ? cause.message : String(cause) })
+
+const decodeCommitProvenance = (value: unknown): CommitProvenance | undefined => {
+  if (value === null || typeof value !== "object") return undefined
+  const candidate = value as Record<string, unknown>
+  return typeof candidate.workstreamId === "string" &&
+      typeof candidate.sessionId === "string" &&
+      typeof candidate.commitId === "string"
+    ? {
+      workstreamId: candidate.workstreamId,
+      sessionId: candidate.sessionId,
+      commitId: candidate.commitId
+    }
+    : undefined
+}
 
 const decodeHistory = (rows: ReadonlyArray<EventRow>): ReadonlyArray<HistoryItem> => {
   const heads = new Map<string, string | null>()
@@ -736,7 +773,12 @@ const decodeHistory = (rows: ReadonlyArray<EventRow>): ReadonlyArray<HistoryItem
       continue
     }
 
-    if (row.event_type === "AgentMessageCommit" || row.event_type === "AgentMessageAdded") {
+    if (
+      row.event_type === "AgentMessageCommit" ||
+      row.event_type === "AgentMessageAdded" ||
+      row.event_type === "CherryPickedAgentMessage"
+    ) {
+      const provenance = decodeCommitProvenance(payload.provenance)
       const commit: Commit = {
         ...metadata,
         type: "AgentMessageCommit",
@@ -746,6 +788,7 @@ const decodeHistory = (rows: ReadonlyArray<EventRow>): ReadonlyArray<HistoryItem
         content: String(payload.content ?? ""),
         inReplyTo: String(payload.inReplyTo ?? parentId ?? ""),
         ...(typeof payload.runId === "string" ? { runId: payload.runId } : {}),
+        ...(provenance === undefined ? {} : { provenance }),
         ...(row.event_type === "AgentMessageAdded" &&
           typeof payload.messageId === "string"
           ? { legacyMessageId: payload.messageId }
@@ -1144,6 +1187,102 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     return item as Extract<Commit, { readonly type: "CompactionCommit" }>
   }).pipe(sql.withTransaction, persist)
 
+  const cherryPick = (
+    sourceSessionId: string,
+    sourceCommitId: string,
+    targetSessionId: string,
+    requestedPeerId: string
+  ): Effect.Effect<
+    | { readonly type: "NotFound"; readonly sessionId: string }
+    | { readonly type: "Settled"; readonly sessionId: string }
+    | {
+      readonly type: "CommitNotFound"
+      readonly sessionId: string
+      readonly commitId: string
+    }
+    | {
+      readonly type: "Appended"
+      readonly item: Extract<Commit, { readonly type: "AgentMessageCommit" }>
+    },
+    PersistenceError
+  > => Effect.gen(function*() {
+    const sourceRows = yield* sessionRows(sourceSessionId)
+    if (sourceRows.length === 0) {
+      return { type: "NotFound" as const, sessionId: sourceSessionId }
+    }
+    const targetRows = yield* sessionRows(targetSessionId)
+    if (targetRows.length === 0) {
+      return { type: "NotFound" as const, sessionId: targetSessionId }
+    }
+
+    const sourceHistory = decodeHistory(sourceRows)
+    const source = sourceHistory.find(
+      (item): item is Extract<
+        Commit,
+        { readonly type: "AgentMessageCommit" | "CompactionCommit" }
+      > =>
+        (item.type === "AgentMessageCommit" || item.type === "CompactionCommit") &&
+        item.commitId === sourceCommitId
+    )
+    if (source === undefined) {
+      return {
+        type: "CommitNotFound" as const,
+        sessionId: sourceSessionId,
+        commitId: sourceCommitId
+      }
+    }
+
+    const state = yield* sessionState(targetSessionId)
+    if (state[0]?.settledAt !== null && state[0]?.settledAt !== undefined) {
+      return { type: "Settled" as const, sessionId: targetSessionId }
+    }
+
+    const workstreams = yield* sql<{ readonly workstreamId: string }>`
+      SELECT workstream_id AS workstreamId
+      FROM sessions
+      WHERE session_id=${sourceSessionId}
+    `
+    const sourceWorkstreamId = workstreams[0]?.workstreamId
+    if (sourceWorkstreamId === undefined) {
+      return { type: "NotFound" as const, sessionId: sourceSessionId }
+    }
+
+    yield* ensurePeerHead(targetSessionId, requestedPeerId)
+    const heads = yield* sql<{ readonly commitId: string | null }>`
+      SELECT commit_id AS commitId
+      FROM peer_branch_heads
+      WHERE peer_id=${requestedPeerId} AND session_id=${targetSessionId}
+    `
+    const parentId = heads[0]?.commitId ?? null
+    const commitId = yield* randomId
+    const item = yield* insert(
+      targetSessionId,
+      commitId,
+      "CherryPickedAgentMessage",
+      {
+        content: source.content,
+        inReplyTo: source.commitId,
+        parentId,
+        provenance: {
+          workstreamId: sourceWorkstreamId,
+          sessionId: sourceSessionId,
+          commitId: source.commitId
+        }
+      },
+      targetRows.at(-1)!.sequence + 1
+    )
+    yield* updateHeadIfCurrent(
+      targetSessionId,
+      requestedPeerId,
+      parentId,
+      commitId
+    )
+    return {
+      type: "Appended" as const,
+      item: item as Extract<Commit, { readonly type: "AgentMessageCommit" }>
+    }
+  }).pipe(sql.withTransaction, persist)
+
   return Service.of({
     check: sql`SELECT 1`.pipe(Effect.asVoid, persist),
     createWorkstream: Effect.fn("Session.createWorkstream")(function*(
@@ -1526,6 +1665,32 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         >
       }
     ),
+    cherryPick: Effect.fn("Session.cherryPick")(function*(
+      sourceSessionId,
+      sourceCommitId,
+      targetSessionId,
+      requestedPeerId = defaultPeerId
+    ) {
+      const result = yield* cherryPick(
+        sourceSessionId,
+        sourceCommitId,
+        targetSessionId,
+        requestedPeerId
+      )
+      if (result.type === "NotFound") {
+        return yield* new NotFound({ sessionId: result.sessionId })
+      }
+      if (result.type === "Settled") {
+        return yield* new Settled({ sessionId: result.sessionId })
+      }
+      if (result.type === "CommitNotFound") {
+        return yield* new CommitNotFound({
+          sessionId: result.sessionId,
+          commitId: result.commitId
+        })
+      }
+      return result.item
+    }),
     checkout: Effect.fn("Session.checkout")(function*(
       sessionId,
       commitId,
