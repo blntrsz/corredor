@@ -49,6 +49,15 @@ export interface Interface {
     runId?: string,
     peerId?: string
   ) => Effect.Effect<void, Session.Error | Session.PersistenceError>
+  readonly interruptAgentRun: (
+    sessionId: string,
+    startingCommitId: string,
+    reason?: string,
+    runId?: string
+  ) => Effect.Effect<
+    Extract<Session.Commit, { readonly type: "InterruptCommit" }> | undefined,
+    Session.Error | Session.PersistenceError
+  >
   readonly checkout: (
     sessionId: string,
     commitId: string | null,
@@ -148,6 +157,21 @@ export const make = Effect.gen(function*() {
           definition,
           runId,
           peerId
+        )
+      }
+    ),
+    interruptAgentRun: Effect.fn("Application.interruptAgentRun")(
+      function*(
+        sessionId: string,
+        startingCommitId: string,
+        reason?: string,
+        runId?: string
+      ) {
+        return yield* runtime.interrupt(
+          sessionId,
+          startingCommitId,
+          reason,
+          runId
         )
       }
     ),

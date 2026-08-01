@@ -233,6 +233,36 @@ const startAgentRun = Effect.gen(function*() {
   Effect.catchCause(() => Effect.succeed(internalServerError()))
 )
 
+const interruptAgentRun = Effect.gen(function*() {
+  const application = yield* Application.Service
+  const params = yield* HttpRouter.params
+  const request = yield* HttpServerRequest.HttpServerRequest
+  const body = yield* Schema.decodeUnknownEffect(Schema.Struct({
+    commitId: Schema.String,
+    reason: Schema.optional(Schema.String),
+    runId: Schema.optional(Schema.String)
+  }))(yield* request.json)
+  const sessionId = params.sessionId
+  if (sessionId === undefined) {
+    return missingSessionId()
+  }
+  const commit = yield* application.interruptAgentRun(
+    sessionId,
+    body.commitId,
+    body.reason,
+    body.runId
+  )
+  return HttpServerResponse.jsonUnsafe(
+    { commit: commit ?? null },
+    { status: 202 }
+  )
+}).pipe(
+  Effect.catchTag("@corredor/Session/NotFound", sessionNotFound),
+  Effect.catchTag("@corredor/Session/Settled", sessionSettled),
+  Effect.catchTag("@corredor/Session/CommitNotFound", commitNotFound),
+  Effect.catchCause(() => Effect.succeed(internalServerError()))
+)
+
 const checkout = Effect.gen(function*() {
   const application = yield* Application.Service
   const params = yield* HttpRouter.params
@@ -393,6 +423,16 @@ const routes = Layer.mergeAll(
     "POST",
     "/v1/sessions/:sessionId/runs",
     startAgentRun
+  ),
+  HttpRouter.add(
+    "POST",
+    "/v1/sessions/:sessionId/interrupt",
+    interruptAgentRun
+  ),
+  HttpRouter.add(
+    "POST",
+    "/v1/sessions/:sessionId/runs/interrupt",
+    interruptAgentRun
   ),
   HttpRouter.add("POST", "/v1/sessions/:sessionId/settle", settleSession),
   HttpRouter.add("POST", "/v1/sessions/:sessionId/reopen", reopenSession),

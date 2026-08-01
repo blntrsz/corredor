@@ -128,6 +128,31 @@ const addPeerBranchHeads = Effect.gen(function*() {
   yield* sql`DROP TABLE session_branch_heads`
 })
 
+/** Keep one durable interruption outcome per Agent Run. */
+const addInterruptCommitCausation = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`CREATE UNIQUE INDEX session_events_interrupt_commit_causation
+    ON session_events(
+      json_extract(payload, '$.inReplyTo'),
+      COALESCE(json_extract(payload, '$.runId'), '')
+    ) WHERE event_type = 'InterruptCommit'`
+})
+
+/** Allow only one terminal outcome for each Agent Run. */
+const addAgentRunOutcomeCausation = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`DROP INDEX session_events_agent_message_causation`
+  yield* sql`DROP INDEX session_events_failure_commit_causation`
+  yield* sql`DROP INDEX session_events_interrupt_commit_causation`
+  yield* sql`CREATE UNIQUE INDEX session_events_agent_run_outcome_causation
+    ON session_events(
+      json_extract(payload, '$.inReplyTo'),
+      COALESCE(json_extract(payload, '$.runId'), '')
+    ) WHERE event_type IN (
+      'AgentMessageCommit', 'FailureCommit', 'InterruptCommit'
+    )`
+})
+
 /** Add durable Workstream ownership and metadata for existing Sessions. */
 const addWorkstreams = Effect.gen(function*() {
   const sql = yield* SqlClient.SqlClient
@@ -196,5 +221,7 @@ export const loader = SqliteMigrator.fromRecord({
   "6_add_agent_run_identity": addAgentRunIdentity,
   "7_add_peer_branch_heads": addPeerBranchHeads,
   "8_add_workstreams": addWorkstreams,
-  "9_add_session_settlement": addSessionSettlement
+  "9_add_session_settlement": addSessionSettlement,
+  "10_add_interrupt_commit_causation": addInterruptCommitCausation,
+  "11_add_agent_run_outcome_causation": addAgentRunOutcomeCausation
 })

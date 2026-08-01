@@ -319,6 +319,12 @@ class TreePicker implements Component, Focusable {
         user: (record) => [cyan("You"), record.content] as const,
         agentMessage: (record) => [green("Agent"), record.content] as const,
         failure: (record) => [red("Agent Failure"), record.reason] as const,
+        interrupt: (record) => [
+          yellow("Interrupt Commit"),
+          `${record.reason}${record.partialOutput.length > 0
+            ? ` · ${record.partialOutput}`
+            : ""}`
+        ] as const,
         tool: (record) => [
           dim(`Tool Commit · ${record.name}`),
           JSON.stringify({
@@ -427,6 +433,7 @@ const make = (
     { name: "history", description: "Check out an earlier Commit" },
     { name: "settle", description: "Settle the current Session" },
     { name: "reopen", description: "Reopen the current Session" },
+    { name: "interrupt", description: "Interrupt the active Agent Run" },
     { name: "exit", description: "Exit Corredor" }
   ], process.cwd()))
   editor.setAutocompleteMaxVisible(6)
@@ -484,6 +491,15 @@ const make = (
     messages.addChild(new Spacer(1))
   }
 
+  const addInterrupt = (reason: string, partialOutput: string) => {
+    messages.addChild(new Text(bold(yellow("Interrupt Commit")), 1, 0))
+    messages.addChild(new Text(yellow(reason), 1, 1))
+    if (partialOutput.length > 0) {
+      messages.addChild(new Markdown(partialOutput, 1, 1, markdownTheme))
+    }
+    messages.addChild(new Spacer(1))
+  }
+
   const orderedHistory = (): ReadonlyArray<HistoryItem> =>
     [...knownItems.values()].sort((a, b) => a.sequence - b.sequence)
 
@@ -507,6 +523,7 @@ const make = (
         user: (entry) => addUserMessage(entry.content),
         agentMessage: (entry) => addAssistantMessage(entry.content),
         failure: (entry) => addFailure(entry.reason),
+        interrupt: (entry) => addInterrupt(entry.reason, entry.partialOutput),
         tool: (entry) => addToolRecord(entry),
         legacyTool: (entry) => addToolRecord(entry)
       })
@@ -566,7 +583,9 @@ const make = (
       branchHeadId = item.commitId
       pending.inReplyTo = item.commitId
     } else if (
-      item.type === "AgentMessageCommit" &&
+      (item.type === "AgentMessageCommit" ||
+        item.type === "FailureCommit" ||
+        item.type === "InterruptCommit") &&
       pending?.inReplyTo === item.inReplyTo
     ) {
       branchHeadId = item.commitId
@@ -759,6 +778,29 @@ const make = (
     })
   }
 
+  const interruptCurrentRun = () => {
+    const startingCommitId = pending?.inReplyTo ?? pending?.commitId
+    if (startingCommitId === undefined) {
+      addErrorMessage("No active Agent Run to interrupt.")
+      return
+    }
+    void Effect.runPromise(proxy.interruptAgentRun(
+      sessionId,
+      startingCommitId,
+      "Interrupted by user"
+    )).then((commit) => {
+      if (stopped) return
+      if (commit === undefined) {
+        addErrorMessage("No active Agent Run to interrupt.")
+        return
+      }
+      renderActivity(commit)
+    }).catch((error: unknown) => {
+      if (stopped) return
+      addErrorMessage(formatError(error))
+    })
+  }
+
   const submit = (input: string) => {
     const prompt = input.trim()
     if (prompt.length === 0 || stopped) return
@@ -770,6 +812,7 @@ const make = (
     if (prompt === "/history" || prompt === "/tree") return openTree()
     if (prompt === "/settle") return settleCurrentSession()
     if (prompt === "/reopen") return reopenCurrentSession()
+    if (prompt === "/interrupt") return interruptCurrentRun()
     if (editor.disableSubmit) return
     if (settled) {
       addErrorMessage("Session is settled; use /reopen before continuing.")
@@ -824,7 +867,8 @@ const make = (
 
   tui.addInputListener((data) => {
     if (matchesKey(data, Key.ctrl("c"))) {
-      stop()
+      if (pending !== undefined) interruptCurrentRun()
+      else stop()
       return { consume: true }
     }
     return undefined

@@ -59,6 +59,11 @@ curl -X POST http://127.0.0.1:5050/v1/sessions/$SESSION_ID/head \
 curl -X POST http://127.0.0.1:5050/v1/sessions/$SESSION_ID/runs \
   -H 'content-type: application/json' \
   -d '{"commitId":"COMMIT_ID","agent":{"id":"default","instructions":"You are a helpful assistant.","tools":["Bash"]},"runId":"independent-run-id"}'
+
+# Interrupt the active Agent Run. The response contains the durable outcome.
+curl -X POST http://127.0.0.1:5050/v1/sessions/$SESSION_ID/interrupt \
+  -H 'content-type: application/json' \
+  -d '{"commitId":"COMMIT_ID","reason":"Stopped by the user"}'
 ```
 
 Sessions can be settled and reopened without removing their history. Default
@@ -83,7 +88,7 @@ Create Session -> SessionCreated activity -> durable outbox
 Submit User Commit -> UserCommit -> durable outbox
                                 -> Agent Runtime reconstructs ancestry
                                 -> completed ToolCommit(s)
-                                -> AgentMessageCommit
+                                -> AgentMessageCommit, InterruptCommit, or FailureCommit
                                 -> API/client observes durable activity
 ```
 
