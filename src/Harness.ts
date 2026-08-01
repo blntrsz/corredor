@@ -570,9 +570,7 @@ const make = (
         (item) => {
           if (navigating) return
           navigating = true
-          const targetId = item.record.type === "UserCommit"
-            ? item.parentId
-            : Session.branchRecordId(item.record)
+          const targetId = Session.branchRecordId(item.record)
           void Effect.runPromise(proxy.checkout(treeSessionId, targetId)).then(() => {
             if (stopped || sessionId !== treeSessionId) return
             branchHeadId = targetId

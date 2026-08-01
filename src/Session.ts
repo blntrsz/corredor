@@ -350,7 +350,20 @@ export const commitGraph = (
 /** Used only once while initializing a local Branch Head during migration. */
 export const legacyBranchHead = (
   history: ReadonlyArray<HistoryItem>
-): string | null => projectCommitGraph(history, undefined, true).headId
+): string | null => {
+  const graph = projectCommitGraph(history, undefined, true)
+  const byId = new Map(graph.nodes.map(
+    (node) => [branchRecordId(node.record), node] as const
+  ))
+  let id = graph.headId
+  while (id !== null) {
+    const node = byId.get(id)
+    if (node === undefined) return null
+    if (isCommit(node.record)) return node.record.commitId
+    id = node.parentId
+  }
+  return null
+}
 
 /** Returns the root-to-head context records for a Branch. */
 export const branchHistory = (
@@ -621,8 +634,20 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
   const sessionIds = new Set(existingRows.map((row) => row.session_id))
   for (const sessionId of sessionIds) {
     const history = decodeHistory(existingRows.filter((row) => row.session_id === sessionId))
+    const migratedHead = legacyBranchHead(history)
+    const currentHeads = yield* sql<{ readonly commitId: string | null }>`
+      SELECT commit_id AS commitId FROM peer_branch_heads
+      WHERE peer_id=${defaultPeerId} AND session_id=${sessionId}`.pipe(persist)
     yield* sql`INSERT OR IGNORE INTO peer_branch_heads (peer_id, session_id, commit_id)
-      VALUES (${defaultPeerId}, ${sessionId}, ${legacyBranchHead(history)})`.pipe(persist)
+      VALUES (${defaultPeerId}, ${sessionId}, ${migratedHead})`.pipe(persist)
+    const currentHead = currentHeads[0]?.commitId
+    const currentRecord = history.find(
+      (item) => historyItemId(item) === currentHead
+    )
+    if (currentRecord?.type === "LegacyToolCall") {
+      yield* sql`UPDATE peer_branch_heads SET commit_id=${migratedHead}
+        WHERE peer_id=${defaultPeerId} AND session_id=${sessionId}`.pipe(persist)
+    }
   }
 
   const insert = Effect.fn("Session.insert")(function*(
@@ -904,7 +929,7 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       if (rows.length === 0) return yield* new NotFound({ sessionId })
       const history = decodeHistory(rows)
       if (commitId !== null && !history.some(
-        (item) => isBranchRecord(item) && branchRecordId(item) === commitId
+        (item) => isCommit(item) && item.commitId === commitId
       )) {
         return yield* new CommitNotFound({ sessionId, commitId })
       }

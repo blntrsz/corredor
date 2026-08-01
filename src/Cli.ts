@@ -6,6 +6,7 @@ import * as DatabaseAdmin from "./DatabaseAdmin.ts"
 import { Harness } from "./Harness.ts"
 import * as Server from "./Server.ts"
 import { defaultServerPort, defaultServerUrl, ensureServer } from "./ServerManager.ts"
+import * as Session from "./Session.ts"
 
 const formatTsvValue = (value: unknown): string => {
   if (value === null || value === undefined) return ""
@@ -75,14 +76,23 @@ const command = Command.make(
     prompt: Argument.string("prompt").pipe(
       Argument.withDescription("An optional first request for the agent"),
       Argument.optional
+    ),
+    peerId: Flag.string("peer-id").pipe(
+      Flag.withDefault(Session.defaultPeerId),
+      Flag.withDescription("Identity of this Peer for local Branch Heads")
     )
   },
-  Effect.fn("Cli.run")(function*({ prompt }) {
+  Effect.fn("Cli.run")(function*({ prompt, peerId }) {
     yield* Effect.tryPromise({
       try: () => ensureServer(import.meta.path),
       catch: (cause) => new Error("Unable to start the Corredor server", { cause })
     }).pipe(Effect.orDie)
-    yield* Harness.run(Option.getOrUndefined(prompt))
+    yield* Harness.run(Option.getOrUndefined(prompt)).pipe(
+      Effect.provide(AgentProxy.layer({
+        baseUrl: defaultServerUrl,
+        peerId
+      }))
+    )
   })
 ).pipe(
   Command.withDescription("Run the interactive Corredor agent"),
@@ -101,7 +111,6 @@ const command = Command.make(
 
 command.pipe(
   Command.run({ version: "0.1.0" }),
-  Effect.provide(AgentProxy.layer({ baseUrl: defaultServerUrl })),
   Effect.provide(BunServices.layer),
   BunRuntime.runMain
 )
