@@ -60,6 +60,12 @@ curl -X POST http://127.0.0.1:5050/v1/sessions/$SESSION_ID/runs \
   -H 'content-type: application/json' \
   -d '{"commitId":"COMMIT_ID","agent":{"id":"default","instructions":"You are a helpful assistant.","tools":["Bash"]},"runId":"independent-run-id"}'
 
+# Compact the complete active ancestry of a Branch. The response is also
+# emitted through the Session activity stream as a Compaction Commit.
+curl -X POST http://127.0.0.1:5050/v1/sessions/$SESSION_ID/compact \
+  -H 'content-type: application/json' \
+  -d '{"commitId":"COMMIT_ID","agent":{"id":"compactor","instructions":"Summarize the Branch.","tools":[]}}'
+
 # Interrupt the active Agent Run. The response contains the durable outcome.
 curl -X POST http://127.0.0.1:5050/v1/sessions/$SESSION_ID/interrupt \
   -H 'content-type: application/json' \
@@ -85,11 +91,12 @@ Commits, and Agent Runs are rejected until the Session is reopened.
 ```text
 Create Session -> SessionCreated activity -> durable outbox
 
-Submit User Commit -> UserCommit -> durable outbox
-                                -> Agent Runtime reconstructs ancestry
-                                -> completed ToolCommit(s)
-                                -> AgentMessageCommit, InterruptCommit, or FailureCommit
-                                -> API/client observes durable activity
+    Submit User Commit -> UserCommit -> durable outbox
+                                    -> Agent Runtime reconstructs ancestry
+                                    -> completed ToolCommit(s)
+                                    -> AgentMessageCommit, CompactionCommit,
+                                       InterruptCommit, or FailureCommit
+                                    -> API/client observes durable activity
 ```
 
 `session_events` is the source of truth. `event_dispatch` is a transactional
@@ -105,6 +112,11 @@ SQLite or run an Agent consumer in the harness process. A completed tool
 interaction is persisted atomically as one Tool Commit containing its name,
 input, and success result or failure. SSE IDs are durable outbox positions, so
 clients can reconnect with `Last-Event-ID` or `?after=<position>`.
+
+Use `/compact` in the interactive client to summarize the current Branch. A
+Compaction Commit points to the selected Branch Head, keeps the earlier
+Commits visible in history, and becomes the only representation of that older
+ancestry in later Agent context.
 
 Workstreams group related Sessions. Create one explicitly, or omit
 `workstreamId` when creating a Session to use the migration-safe default

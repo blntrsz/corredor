@@ -152,6 +152,108 @@ it.live(
 )
 
 it.live(
+  "compacts a Branch through HTTP and emits the Compaction Commit on the stream",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-http-compaction-")
+    const port = yield* Effect.promise(availablePort)
+    const baseUrl = `http://127.0.0.1:${port}`
+    const contexts: Array<ReadonlyArray<Agent.ContextEntry>> = []
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (context, _onEvent, definition) => Effect.sync(() => {
+        contexts.push(context)
+        return definition?.id === "compactor"
+          ? "HTTP compacted summary"
+          : "HTTP answer"
+      })
+    }))
+    const layer = Layer.mergeAll(
+      Server.layerWithoutDependencies({ host: "127.0.0.1", port }),
+      AgentProxy.layer({ baseUrl, peerId: "http-compaction-peer" })
+    ).pipe(
+      Layer.provide(Session.layer(path)),
+      Layer.provide(fakeAgent)
+    )
+
+    const result = yield* Effect.gen(function*() {
+      const proxy = yield* AgentProxy.Service
+      const session = yield* proxy.createSession("http-compaction-session")
+      const activityFiber = yield* proxy.streamActivity(
+        session.sessionId,
+        session.position
+      ).pipe(
+        Stream.take(3),
+        Stream.runCollect,
+        Effect.forkScoped
+      )
+      yield* proxy.submitUserCommit(
+        session.sessionId,
+        "Explain the HTTP boundary",
+        "http-compaction-user"
+      )
+
+      let beforeCompaction = yield* proxy.history(session.sessionId)
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (beforeCompaction.items.some(
+          (item) => item.type === "AgentMessageCommit"
+        )) break
+        yield* Effect.sleep("10 millis")
+        beforeCompaction = yield* proxy.history(session.sessionId)
+      }
+      const sourceHeadId = beforeCompaction.branchHeadId
+      if (sourceHeadId === null) {
+        return yield* Effect.die("timed out waiting for the HTTP Branch Head")
+      }
+      const compaction = yield* proxy.compact(
+        session.sessionId,
+        sourceHeadId,
+        {
+          id: "compactor",
+          instructions: "Summarize the HTTP Branch.",
+          tools: []
+        },
+        "http-compaction-run"
+      )
+      const activity = Array.from(yield* Fiber.join(activityFiber))
+      yield* proxy.submitUserCommit(
+        session.sessionId,
+        "Continue after HTTP compaction",
+        "http-post-compaction-user"
+      )
+      let history = yield* proxy.history(session.sessionId)
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (history.items.some(
+          (item) => item.type === "AgentMessageCommit" &&
+            item.inReplyTo === "http-post-compaction-user"
+        )) break
+        yield* Effect.sleep("10 millis")
+        history = yield* proxy.history(session.sessionId)
+      }
+      return { sourceHeadId, compaction, activity, history, contexts }
+    }).pipe(Effect.provide(layer))
+
+    expect(result.compaction).toMatchObject({
+      type: "CompactionCommit",
+      parentId: result.sourceHeadId,
+      inReplyTo: result.sourceHeadId,
+      runId: "http-compaction-run",
+      content: "HTTP compacted summary"
+    })
+    expect(result.activity.map((item) => item.type)).toEqual([
+      "UserCommit",
+      "AgentMessageCommit",
+      "CompactionCommit"
+    ])
+    expect(result.history.items).toContainEqual(result.compaction)
+    expect(result.history.branchHeadId).not.toBe(result.compaction.commitId)
+    expect(result.contexts.map((context) => context.map((entry) => entry.type))).toEqual([
+      ["User"],
+      ["User", "AgentMessage"],
+      ["Compaction", "User"]
+    ])
+  })
+)
+
+it.live(
   "interrupts a streamed Agent Run through the HTTP boundary",
   () => Effect.gen(function*() {
     const { path } = yield* temporaryDatabase("corredor-http-interrupt-")

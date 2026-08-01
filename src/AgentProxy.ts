@@ -50,6 +50,15 @@ export interface Interface {
     definition: Agent.Definition,
     runId?: string
   ) => Effect.Effect<void, ProxyError>
+  readonly compact: (
+    sessionId: string,
+    startingCommitId: string,
+    definition?: Agent.Definition,
+    runId?: string
+  ) => Effect.Effect<
+    Extract<Session.Commit, { readonly type: "CompactionCommit" }>,
+    ProxyError
+  >
   readonly interruptAgentRun: (
     sessionId: string,
     startingCommitId: string,
@@ -291,6 +300,30 @@ export const make = (
           agent: definition,
           ...(runId === undefined ? {} : { runId })
         }))))
+      }
+    ),
+    compact: Effect.fn("AgentProxy.compact")(
+      function*(
+        sessionId: string,
+        startingCommitId: string,
+        definition: Agent.Definition = Agent.defaultDefinition,
+        runId?: string
+      ) {
+        const body = yield* responseJson(withPeer(HttpClientRequest.post(
+          url(`/v1/sessions/${encodeURIComponent(sessionId)}/compact`)
+        ).pipe(HttpClientRequest.bodyJsonUnsafe({
+          commitId: startingCommitId,
+          agent: definition,
+          ...(runId === undefined ? {} : { runId })
+        }))))
+        const decoded = yield* Schema.decodeUnknownEffect(CommitResponse)(body)
+          .pipe(Effect.mapError(proxyError))
+        if (decoded.commit.type !== "CompactionCommit") {
+          return yield* new ProxyError({
+            message: "Compaction API returned a non-Compaction Commit"
+          })
+        }
+        return decoded.commit
       }
     ),
     interruptAgentRun: Effect.fn("AgentProxy.interruptAgentRun")(

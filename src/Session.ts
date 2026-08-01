@@ -49,6 +49,12 @@ export type Commit =
     readonly legacyMessageId?: string
   }
   | CommitMetadata & {
+    readonly type: "CompactionCommit"
+    readonly content: string
+    readonly inReplyTo: string
+    readonly runId?: string
+  }
+  | CommitMetadata & {
     readonly type: "FailureCommit"
     readonly reason: string
     readonly inReplyTo: string
@@ -126,6 +132,7 @@ export type BranchRecord = Commit | LegacyToolCall
 
 type UserCommit = Extract<Commit, { readonly type: "UserCommit" }>
 type AgentMessageCommit = Extract<Commit, { readonly type: "AgentMessageCommit" }>
+type CompactionCommit = Extract<Commit, { readonly type: "CompactionCommit" }>
 type FailureCommit = Extract<Commit, { readonly type: "FailureCommit" }>
 type InterruptCommit = Extract<Commit, { readonly type: "InterruptCommit" }>
 type ToolCommit = Extract<Commit, { readonly type: "ToolCommit" }>
@@ -133,6 +140,7 @@ type ToolCommit = Extract<Commit, { readonly type: "ToolCommit" }>
 export interface BranchRecordHandlers<A> {
   readonly user: (record: UserCommit) => A
   readonly agentMessage: (record: AgentMessageCommit) => A
+  readonly compaction: (record: CompactionCommit) => A
   readonly failure: (record: FailureCommit) => A
   readonly interrupt: (record: InterruptCommit) => A
   readonly tool: (record: ToolCommit) => A
@@ -146,6 +154,7 @@ export const foldBranchRecord = <A>(
 ): A => {
   if (record.type === "UserCommit") return handlers.user(record)
   if (record.type === "AgentMessageCommit") return handlers.agentMessage(record)
+  if (record.type === "CompactionCommit") return handlers.compaction(record)
   if (record.type === "FailureCommit") return handlers.failure(record)
   if (record.type === "InterruptCommit") return handlers.interrupt(record)
   if (record.type === "ToolCommit") return handlers.tool(record)
@@ -216,6 +225,14 @@ const AgentMessageCommitSchema = Schema.Struct({
   legacyMessageId: Schema.optional(Schema.String)
 })
 
+const CompactionCommitSchema = Schema.Struct({
+  ...commitMetadata,
+  type: Schema.Literal("CompactionCommit"),
+  content: Schema.String,
+  inReplyTo: Schema.String,
+  runId: Schema.optional(Schema.String)
+})
+
 const FailureCommitSchema = Schema.Struct({
   ...commitMetadata,
   type: Schema.Literal("FailureCommit"),
@@ -260,6 +277,7 @@ export const HistoryItemSchema = Schema.Union([
   UserCommitSchema,
   ToolCommitSchema,
   AgentMessageCommitSchema,
+  CompactionCommitSchema,
   FailureCommitSchema,
   InterruptCommitSchema,
   Schema.Struct({
@@ -290,6 +308,7 @@ export const CommitSchema = Schema.Union([
   UserCommitSchema,
   ToolCommitSchema,
   AgentMessageCommitSchema,
+  CompactionCommitSchema,
   FailureCommitSchema,
   InterruptCommitSchema
 ])
@@ -417,6 +436,7 @@ export const isCommit = (item: HistoryItem): item is Commit =>
   item.type === "UserCommit" ||
   item.type === "ToolCommit" ||
   item.type === "AgentMessageCommit" ||
+  item.type === "CompactionCommit" ||
   item.type === "FailureCommit" ||
   item.type === "InterruptCommit"
 
@@ -571,6 +591,13 @@ export interface Interface {
     runId?: string,
     peerId?: string
   ) => Effect.Effect<Extract<Commit, { readonly type: "AgentMessageCommit" }>, Error>
+  readonly appendCompactionCommit: (
+    sessionId: string,
+    content: string,
+    inReplyTo: string,
+    runId?: string,
+    peerId?: string
+  ) => Effect.Effect<Extract<Commit, { readonly type: "CompactionCommit" }>, Error>
   readonly appendFailureCommit: (
     sessionId: string,
     reason: string,
@@ -610,6 +637,7 @@ type RawEventType =
   | "UserCommit"
   | "ToolCommit"
   | "AgentMessageCommit"
+  | "CompactionCommit"
   | "FailureCommit"
   | "InterruptCommit"
   | "UserMessageAdded"
@@ -722,6 +750,22 @@ const decodeHistory = (rows: ReadonlyArray<EventRow>): ReadonlyArray<HistoryItem
           typeof payload.messageId === "string"
           ? { legacyMessageId: payload.messageId }
           : {})
+      }
+      items.push(commit)
+      if (parentId === currentHead) heads.set(row.session_id, commit.commitId)
+      continue
+    }
+
+    if (row.event_type === "CompactionCommit") {
+      const commit: Commit = {
+        ...metadata,
+        type: "CompactionCommit",
+        commitId: row.event_id,
+        parentId,
+        createdAt,
+        content: String(payload.content ?? ""),
+        inReplyTo: String(payload.inReplyTo ?? parentId ?? ""),
+        ...(typeof payload.runId === "string" ? { runId: payload.runId } : {})
       }
       items.push(commit)
       if (parentId === currentHead) heads.set(row.session_id, commit.commitId)
@@ -1058,6 +1102,48 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     return { type: "Appended" as const, item: item as Commit }
   }).pipe(sql.withTransaction, persist)
 
+  const appendCompactionCommit = (
+    sessionId: string,
+    content: string,
+    inReplyTo: string,
+    runId: string | undefined,
+    peerId: string
+  ): Effect.Effect<
+    Extract<Commit, { readonly type: "CompactionCommit" }>,
+    PersistenceError
+  > => Effect.gen(function*() {
+    const rows = yield* sessionRows(sessionId)
+    if (rows.length === 0) return yield* new NotFound({ sessionId })
+    const state = yield* sessionState(sessionId)
+    if (state[0]?.settledAt !== null && state[0]?.settledAt !== undefined) {
+      return yield* new Settled({ sessionId })
+    }
+    const history = decodeHistory(rows)
+    const existing = history.find(
+      (item): item is Extract<Commit, { readonly type: "CompactionCommit" }> =>
+        item.type === "CompactionCommit" &&
+        item.inReplyTo === inReplyTo &&
+        item.runId === runId
+    )
+    if (existing !== undefined) return existing
+    if (!history.some(
+      (item) => isBranchRecord(item) && branchRecordId(item) === inReplyTo
+    )) {
+      return yield* new CommitNotFound({ sessionId, commitId: inReplyTo })
+    }
+    yield* ensurePeerHead(sessionId, peerId)
+    const commitId = yield* randomId
+    const item = yield* insert(
+      sessionId,
+      commitId,
+      "CompactionCommit",
+      { content, inReplyTo, parentId: inReplyTo, runId, peerId },
+      rows.at(-1)!.sequence + 1
+    )
+    yield* updateHeadIfCurrent(sessionId, peerId, inReplyTo, commitId)
+    return item as Extract<Commit, { readonly type: "CompactionCommit" }>
+  }).pipe(sql.withTransaction, persist)
+
   return Service.of({
     check: sql`SELECT 1`.pipe(Effect.asVoid, persist),
     createWorkstream: Effect.fn("Session.createWorkstream")(function*(
@@ -1352,6 +1438,23 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
           Commit,
           { readonly type: "AgentMessageCommit" }
         >
+      }
+    ),
+    appendCompactionCommit: Effect.fn("Session.appendCompactionCommit")(
+      function*(
+        sessionId,
+        content,
+        inReplyTo,
+        runId,
+        requestedPeerId = defaultPeerId
+      ) {
+        return yield* appendCompactionCommit(
+          sessionId,
+          content,
+          inReplyTo,
+          runId,
+          requestedPeerId
+        )
       }
     ),
     appendFailureCommit: Effect.fn("Session.appendFailureCommit")(

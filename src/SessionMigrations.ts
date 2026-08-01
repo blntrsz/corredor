@@ -150,6 +150,19 @@ const addAgentRunOutcomeCausation = Effect.gen(function*() {
       COALESCE(json_extract(payload, '$.runId'), '')
     ) WHERE event_type IN (
       'AgentMessageCommit', 'FailureCommit', 'InterruptCommit'
+  )`
+})
+
+/** Treat Compaction as the terminal outcome of its stateless Agent Run. */
+const addCompactionCommitCausation = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`DROP INDEX session_events_agent_run_outcome_causation`
+  yield* sql`CREATE UNIQUE INDEX session_events_agent_run_outcome_causation
+    ON session_events(
+      json_extract(payload, '$.inReplyTo'),
+      COALESCE(json_extract(payload, '$.runId'), '')
+    ) WHERE event_type IN (
+      'AgentMessageCommit', 'CompactionCommit', 'FailureCommit', 'InterruptCommit'
     )`
 })
 
@@ -223,5 +236,6 @@ export const loader = SqliteMigrator.fromRecord({
   "8_add_workstreams": addWorkstreams,
   "9_add_session_settlement": addSessionSettlement,
   "10_add_interrupt_commit_causation": addInterruptCommitCausation,
-  "11_add_agent_run_outcome_causation": addAgentRunOutcomeCausation
+  "11_add_agent_run_outcome_causation": addAgentRunOutcomeCausation,
+  "12_add_compaction_commit_causation": addCompactionCommitCausation
 })

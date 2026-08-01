@@ -49,6 +49,16 @@ export interface Interface {
     runId?: string,
     peerId?: string
   ) => Effect.Effect<void, Session.Error | Session.PersistenceError>
+  readonly compact: (
+    sessionId: string,
+    startingCommitId: string,
+    definition?: Agent.Definition,
+    runId?: string,
+    peerId?: string
+  ) => Effect.Effect<
+    Extract<Session.Commit, { readonly type: "CompactionCommit" }>,
+    Session.Error | Session.PersistenceError
+  >
   readonly interruptAgentRun: (
     sessionId: string,
     startingCommitId: string,
@@ -152,6 +162,23 @@ export const make = Effect.gen(function*() {
         peerId?: string
       ) {
         yield* runtime.start(
+          sessionId,
+          startingCommitId,
+          definition,
+          runId,
+          peerId
+        )
+      }
+    ),
+    compact: Effect.fn("Application.compact")(
+      function*(
+        sessionId: string,
+        startingCommitId: string,
+        definition: Agent.Definition = Agent.defaultDefinition,
+        runId?: string,
+        peerId?: string
+      ) {
+        return yield* runtime.compact(
           sessionId,
           startingCommitId,
           definition,

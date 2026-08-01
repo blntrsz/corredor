@@ -326,6 +326,10 @@ class TreePicker implements Component, Focusable {
       const [role, rawContent] = Session.foldBranchRecord(item.record, {
         user: (record) => [cyan("You"), record.content] as const,
         agentMessage: (record) => [green("Agent"), record.content] as const,
+        compaction: (record) => [
+          cyan("Compaction Commit"),
+          record.content
+        ] as const,
         failure: (record) => [red("Agent Failure"), record.reason] as const,
         interrupt: (record) => [
           yellow("Interrupt Commit"),
@@ -439,6 +443,7 @@ const make = (
     { name: "resume", description: "Resume a previous session" },
     { name: "resume-settled", description: "Inspect a settled Session" },
     { name: "history", description: "Check out an earlier Commit" },
+    { name: "compact", description: "Compact the current Branch" },
     { name: "settle", description: "Settle the current Session" },
     { name: "reopen", description: "Reopen the current Session" },
     { name: "interrupt", description: "Interrupt the active Agent Run" },
@@ -455,6 +460,12 @@ const make = (
   const addAssistantMessage = (response: string) => {
     messages.addChild(new Text(bold(green("Agent")), 1, 0))
     messages.addChild(new Markdown(response, 1, 1, markdownTheme))
+    messages.addChild(new Spacer(1))
+  }
+
+  const addCompaction = (summary: string) => {
+    messages.addChild(new Text(bold(cyan("Compaction Commit")), 1, 0))
+    messages.addChild(new Markdown(summary, 1, 1, markdownTheme))
     messages.addChild(new Spacer(1))
   }
 
@@ -530,6 +541,7 @@ const make = (
       Session.foldBranchRecord(record, {
         user: (entry) => addUserMessage(entry.content),
         agentMessage: (entry) => addAssistantMessage(entry.content),
+        compaction: (entry) => addCompaction(entry.content),
         failure: (entry) => addFailure(entry.reason),
         interrupt: (entry) => addInterrupt(entry.reason, entry.partialOutput),
         tool: (entry) => addToolRecord(entry),
@@ -592,6 +604,7 @@ const make = (
       pending.inReplyTo = item.commitId
     } else if (
       (item.type === "AgentMessageCommit" ||
+        item.type === "CompactionCommit" ||
         item.type === "FailureCommit" ||
         item.type === "InterruptCommit") &&
       pendingRunMatchesOutcome(pending, item.inReplyTo)
@@ -766,6 +779,27 @@ const make = (
     })
   }
 
+  const compactCurrentBranch = () => {
+    if (settled) {
+      addErrorMessage("Session is settled; use /reopen before compacting.")
+      return
+    }
+    if (branchHeadId === null) {
+      addErrorMessage("There is no Branch Head to compact yet.")
+      return
+    }
+    const sourceHeadId = branchHeadId
+    void Effect.runPromise(proxy.compact(sessionId, sourceHeadId)).then((commit) => {
+      if (stopped) return
+      renderActivity(commit)
+      lifecycleNotice = "Branch compacted. Earlier Commits remain available in history."
+      renderMessages()
+    }).catch((error: unknown) => {
+      if (stopped) return
+      addErrorMessage(formatError(error))
+    })
+  }
+
   const settleCurrentSession = () => {
     void Effect.runPromise(proxy.settle(sessionId)).then((event) => {
       if (stopped) return
@@ -818,6 +852,7 @@ const make = (
     if (prompt === "/resume") return resumeSession()
     if (prompt === "/resume-settled") return resumeSession("settled")
     if (prompt === "/history" || prompt === "/tree") return openTree()
+    if (prompt === "/compact") return compactCurrentBranch()
     if (prompt === "/settle") return settleCurrentSession()
     if (prompt === "/reopen") return reopenCurrentSession()
     if (prompt === "/interrupt") return interruptCurrentRun()
