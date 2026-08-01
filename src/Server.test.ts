@@ -185,7 +185,45 @@ it.live(
       const workstreams = yield* proxy.listWorkstreams()
       const inspected = yield* proxy.workstream(workstream.workstreamId)
       const filtered = yield* proxy.listSessions(workstream.workstreamId)
-      return { workstream, first, second, workstreams, inspected, filtered }
+      const duplicateStatus = yield* Effect.promise(async () => {
+        const response = await fetch(`${baseUrl}/v1/workstreams`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ workstreamId: workstream.workstreamId })
+        })
+        await response.text()
+        return response.status
+      })
+      const missingStatus = yield* Effect.promise(async () => {
+        const response = await fetch(
+          `${baseUrl}/v1/workstreams/missing-workstream`
+        )
+        await response.text()
+        return response.status
+      })
+      const missingOwnerStatus = yield* Effect.promise(async () => {
+        const response = await fetch(`${baseUrl}/v1/sessions`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            sessionId: "missing-owner-session",
+            workstreamId: "missing-workstream"
+          })
+        })
+        await response.text()
+        return response.status
+      })
+      return {
+        workstream,
+        first,
+        second,
+        workstreams,
+        inspected,
+        filtered,
+        duplicateStatus,
+        missingStatus,
+        missingOwnerStatus
+      }
     }).pipe(Effect.provide(layer))
 
     expect(result.workstream).toMatchObject({
@@ -209,6 +247,9 @@ it.live(
       "workstream-http",
       "workstream-http"
     ])
+    expect(result.duplicateStatus).toBe(409)
+    expect(result.missingStatus).toBe(404)
+    expect(result.missingOwnerStatus).toBe(404)
   })
 )
 
