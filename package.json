@@ -4,10 +4,15 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "agent": "bun run src/Cli.ts"
+    "agent": "bun run src/Cli.ts",
+    "test": "bun run --bun vitest run",
+    "test:watch": "bun run --bun vitest",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@effect/vitest": "4.0.0-beta.102",
+    "@types/bun": "latest",
+    "vitest": "4.1.10"
   },
   "peerDependencies": {
     "typescript": "^5"

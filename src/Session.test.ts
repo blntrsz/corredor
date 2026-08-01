@@ -1,131 +1,147 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, it } from "@effect/vitest"
 import {
-  conversationBranch,
-  conversationParentId,
-  conversationTree,
-  type SessionEvent,
-  type StoredEvent
+  branchHistory,
+  commitGraph,
+  type Commit,
+  type HistoryItem,
+  type LegacyNavigation
 } from "./Session.ts"
 
-const stored = (
-  eventId: string,
+type CommitInput = Commit extends infer Variant
+  ? Variant extends Commit
+    ? Omit<Variant, "sessionId" | "sequence" | "position" | "createdAt">
+    : never
+  : never
+
+const commit = (
   sequence: number,
-  event: SessionEvent
-): StoredEvent => ({
-  ...event,
-  eventId,
+  value: CommitInput
+): Commit => ({
+  ...value,
   sessionId: "session",
   sequence,
   position: sequence,
-  occurredAt: new Date(sequence).toISOString()
-} as StoredEvent)
+  createdAt: new Date(sequence).toISOString()
+} as Commit)
 
-describe("conversation tree", () => {
-  test("keeps old linear events compatible", () => {
-    const events = [
-      stored("u1", 1, {
-        type: "UserMessageAdded",
-        payload: { messageId: "message-1", content: "hello" }
+describe("Commit graph", () => {
+  it("preserves canonical single-parent ancestry", () => {
+    const history = [
+      commit(1, {
+        type: "UserCommit",
+        commitId: "u1",
+        parentId: null,
+        content: "hello"
       }),
-      stored("a1", 2, {
-        type: "AgentMessageAdded",
-        payload: { messageId: "message-2", content: "hi", inReplyTo: "u1" }
+      commit(2, {
+        type: "AgentMessageCommit",
+        commitId: "a1",
+        parentId: "u1",
+        content: "hi",
+        inReplyTo: "u1"
       })
     ]
 
-    expect(conversationTree(events).leafId).toBe("a1")
-    expect(conversationParentId(events, "a1")).toBe("u1")
-    expect(conversationBranch(events).map((event) => event.eventId)).toEqual(["u1", "a1"])
+    expect(commitGraph(history).headId).toBe("a1")
+    expect(commitGraph(history).nodes[1]?.parentId).toBe("u1")
+    expect(branchHistory(history).map((entry) =>
+      entry.type === "LegacyToolCall" ? entry.legacyId : entry.commitId
+    )).toEqual(["u1", "a1"])
   })
 
-  test("navigates to an earlier point and preserves both branches", () => {
-    const events = [
-      stored("u1", 1, {
-        type: "UserMessageAdded",
-        payload: { messageId: "message-1", content: "root", parentId: null }
+  it("preserves divergent Branches without letting a delayed response move the derived head", () => {
+    const history = [
+      commit(1, {
+        type: "UserCommit",
+        commitId: "u1",
+        parentId: null,
+        content: "one"
       }),
-      stored("a1", 2, {
-        type: "AgentMessageAdded",
-        payload: { messageId: "message-2", content: "root reply", inReplyTo: "u1", parentId: "u1" }
+      commit(2, {
+        type: "UserCommit",
+        commitId: "u2",
+        parentId: "u1",
+        content: "two"
       }),
-      stored("u2", 3, {
-        type: "UserMessageAdded",
-        payload: { messageId: "message-3", content: "first branch", parentId: "a1" }
-      }),
-      stored("a2", 4, {
-        type: "AgentMessageAdded",
-        payload: { messageId: "message-4", content: "first reply", inReplyTo: "u2", parentId: "u2" }
-      }),
-      stored("navigation", 5, {
-        type: "SessionTreeNavigated",
-        payload: { targetId: "a1" }
-      }),
-      stored("u3", 6, {
-        type: "UserMessageAdded",
-        payload: { messageId: "message-5", content: "second branch", parentId: "a1" }
-      }),
-      stored("a3", 7, {
-        type: "AgentMessageAdded",
-        payload: { messageId: "message-6", content: "second reply", inReplyTo: "u3", parentId: "u3" }
+      commit(3, {
+        type: "AgentMessageCommit",
+        commitId: "a1",
+        parentId: "u1",
+        content: "late",
+        inReplyTo: "u1"
       })
     ]
 
-    const tree = conversationTree(events)
-    expect(tree.nodes.map((node) => node.event.eventId)).toEqual(["u1", "a1", "u2", "a2", "u3", "a3"])
-    expect(tree.leafId).toBe("a3")
-    expect(conversationBranch(events).map((event) => event.eventId)).toEqual(["u1", "a1", "u3", "a3"])
-    expect(conversationBranch(events, "a2").map((event) => event.eventId)).toEqual(["u1", "a1", "u2", "a2"])
+    expect(commitGraph(history).headId).toBe("u2")
+    expect(branchHistory(history).map((entry) =>
+      entry.type === "LegacyToolCall" ? entry.legacyId : entry.commitId
+    )).toEqual(["u1", "u2"])
+    expect(branchHistory(history, "a1").map((entry) =>
+      entry.type === "LegacyToolCall" ? entry.legacyId : entry.commitId
+    )).toEqual(["u1", "a1"])
   })
 
-  test("can branch directly from a tool call", () => {
-    const events = [
-      stored("u1", 1, {
-        type: "UserMessageAdded",
-        payload: { messageId: "message-1", content: "inspect", parentId: null }
+  it("keeps a completed Tool Commit atomic in ancestry", () => {
+    const history = [
+      commit(1, {
+        type: "UserCommit",
+        commitId: "u1",
+        parentId: null,
+        content: "inspect"
       }),
-      stored("tool1", 2, {
-        type: "AgentToolCallAdded",
-        payload: {
-          toolCallId: "call-1",
-          name: "Bash",
-          input: { command: "pwd" },
-          inReplyTo: "u1",
-          index: 0,
-          parentId: "u1"
-        }
-      }),
-      stored("navigation", 3, {
-        type: "SessionTreeNavigated",
-        payload: { targetId: "tool1" }
-      }),
-      stored("u2", 4, {
-        type: "UserMessageAdded",
-        payload: { messageId: "message-2", content: "continue differently", parentId: "tool1" }
+      commit(2, {
+        type: "ToolCommit",
+        commitId: "t1",
+        parentId: "u1",
+        toolCallId: "call-1",
+        name: "Bash",
+        input: { command: "pwd" },
+        outcome: {
+          type: "Success",
+          result: { exitCode: 0, stdout: "/repo\n", stderr: "" }
+        },
+        inReplyTo: "u1",
+        index: 0
       })
     ]
 
-    expect(conversationTree(events).nodes.map((node) => node.event.eventId)).toEqual(["u1", "tool1", "u2"])
-    expect(conversationBranch(events).map((event) => event.eventId)).toEqual(["u1", "tool1", "u2"])
+    expect(branchHistory(history)).toEqual(history)
   })
 
-  test("does not let a delayed response steal the active branch", () => {
-    const events = [
-      stored("u1", 1, {
-        type: "UserMessageAdded",
-        payload: { messageId: "message-1", content: "one", parentId: null }
+  it("uses legacy navigation only as readable migration input", () => {
+    const navigation: LegacyNavigation = {
+      type: "LegacyNavigation",
+      activityId: "navigation",
+      sessionId: "session",
+      sequence: 3,
+      position: 3,
+      occurredAt: new Date(3).toISOString(),
+      targetId: "u1"
+    }
+    const history: ReadonlyArray<HistoryItem> = [
+      commit(1, {
+        type: "UserCommit",
+        commitId: "u1",
+        parentId: null,
+        content: "root"
       }),
-      stored("u2", 2, {
-        type: "UserMessageAdded",
-        payload: { messageId: "message-2", content: "two", parentId: "u1" }
+      commit(2, {
+        type: "AgentMessageCommit",
+        commitId: "a1",
+        parentId: "u1",
+        content: "reply",
+        inReplyTo: "u1"
       }),
-      stored("a1", 3, {
-        type: "AgentMessageAdded",
-        payload: { messageId: "message-3", content: "late", inReplyTo: "u1", parentId: "u1" }
+      navigation,
+      commit(4, {
+        type: "UserCommit",
+        commitId: "u2",
+        parentId: "u1",
+        content: "branch"
       })
     ]
 
-    expect(conversationTree(events).leafId).toBe("u2")
-    expect(conversationBranch(events).map((event) => event.eventId)).toEqual(["u1", "u2"])
-    expect(conversationBranch(events, "a1").map((event) => event.eventId)).toEqual(["u1", "a1"])
+    expect(commitGraph(history).headId).toBe("u2")
+    expect(commitGraph(history).nodes).toHaveLength(3)
   })
 })

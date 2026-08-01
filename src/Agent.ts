@@ -93,18 +93,37 @@ export namespace Agent {
       readonly isFailure: boolean
     }
 
-  export interface Runner {
-    readonly run: <E = never, R = never>(
-      prompt: string,
-      onEvent?: (event: Event) => Effect.Effect<void, E, R>
-    ) => Effect.Effect<string, Error | E, R>
-  }
+  export type ContextEntry =
+    | {
+      readonly type: "User"
+      readonly commitId: string
+      readonly content: string
+    }
+    | {
+      readonly type: "AgentMessage"
+      readonly commitId: string
+      readonly content: string
+    }
+    | {
+      readonly type: "Tool"
+      readonly commitId: string
+      readonly name: string
+      readonly input: unknown
+      readonly outcome: {
+        readonly type: "Success" | "Failure"
+        readonly value: unknown
+      }
+    }
 
   export interface Interface {
-    /** Creates isolated conversational state for one persisted session. */
-    readonly create: (
-      history?: ReadonlyArray<{ readonly role: "user" | "assistant"; readonly content: string }>
-    ) => Effect.Effect<Runner>
+    /**
+     * Runs statelessly from durable Commit ancestry. The implementation may
+     * allocate transient chat state, but none survives this operation.
+     */
+    readonly run: <E = never, R = never>(
+      context: ReadonlyArray<ContextEntry>,
+      onEvent: (event: Event) => Effect.Effect<void, E, R>
+    ) => Effect.Effect<string, Error | E, R>
   }
 
   export class Service extends Context.Service<Service, Interface>()(
@@ -114,14 +133,45 @@ export namespace Agent {
   export const make = Effect.gen(function*() {
     const languageModel = yield* LanguageModel.LanguageModel
     const toolkit = yield* Tools
-    const create = (history: ReadonlyArray<{ readonly role: "user" | "assistant"; readonly content: string }> = []) => Effect.gen(function*() {
-      const semaphore = yield* Semaphore.make(1)
-      const chat = yield* Chat.fromPrompt([
-        { role: "system", content: systemPrompt },
-        ...history
-      ])
+    const semaphore = yield* Semaphore.make(1)
+    const run: Interface["run"] = Effect.fn("Agent.run")(
+      function*<E = never, R = never>(
+        context: ReadonlyArray<ContextEntry>,
+        onEvent: (event: Event) => Effect.Effect<void, E, R>
+      ) {
+        const latest = context.at(-1)
+        const resumingAfterTool = latest?.type === "Tool"
+        const prompt = latest?.type === "User"
+          ? latest.content
+          : resumingAfterTool
+          ? "Continue from the durable completed tool interaction. Use another tool only if needed."
+          : ""
+        const historyEntries = latest?.type === "User"
+          ? context.slice(0, -1)
+          : context
+        const history = historyEntries.map((entry) => {
+          if (entry.type === "User") {
+            return { role: "user" as const, content: entry.content }
+          }
+          if (entry.type === "AgentMessage") {
+            return { role: "assistant" as const, content: entry.content }
+          }
+          const outcome = entry.outcome.type === "Success"
+            ? { result: entry.outcome.value }
+            : { failure: entry.outcome.value }
+          return {
+            role: "assistant" as const,
+            content: `[Completed tool ${entry.name}: ${JSON.stringify({
+              input: entry.input,
+              ...outcome
+            })}]`
+          }
+        })
+        const chat = yield* Chat.fromPrompt([
+          { role: "system", content: systemPrompt },
+          ...history
+        ])
 
-      const run: Runner["run"] = (prompt, onEvent) => Effect.gen(function*() {
         for (let turn = 0; turn < maxTurns; turn++) {
           const response = yield* chat.generateText({
             prompt: turn === 0 ? prompt : [],
@@ -132,24 +182,22 @@ export namespace Agent {
               Effect.fail(new ModelError({ reason: error.reason })))
           )
 
-          if (onEvent !== undefined) {
-            for (const part of response.content) {
-              if (part.type === "tool-call") {
-                yield* onEvent({
-                  type: "ToolCall",
-                  id: part.id,
-                  name: part.name,
-                  input: part.params
-                })
-              } else if (part.type === "tool-result") {
-                yield* onEvent({
-                  type: "ToolResult",
-                  id: part.id,
-                  name: part.name,
-                  result: part.result,
-                  isFailure: part.isFailure
-                })
-              }
+          for (const part of response.content) {
+            if (part.type === "tool-call") {
+              yield* onEvent({
+                type: "ToolCall",
+                id: part.id,
+                name: part.name,
+                input: part.params
+              })
+            } else if (part.type === "tool-result") {
+              yield* onEvent({
+                type: "ToolResult",
+                id: part.id,
+                name: part.name,
+                result: part.result,
+                isFailure: part.isFailure
+              })
             }
           }
 
@@ -159,11 +207,11 @@ export namespace Agent {
         }
 
         return yield* new TurnLimitExceeded({ maxTurns })
-      }).pipe(semaphore.withPermits(1))
-      return { run }
-    })
+      },
+      (effect) => effect.pipe(semaphore.withPermits(1))
+    )
 
-    return Service.of({ create })
+    return Service.of({ run })
   })
 
   export const layerWithoutDependencies = Layer.effect(Service, make)
@@ -196,4 +244,3 @@ export namespace Agent {
     Layer.provide([deepSeekLanguageModelLayer, toolsLayer])
   )
 }
-

@@ -16,10 +16,10 @@ import {
   truncateToWidth,
   TUI
 } from "@earendil-works/pi-tui"
-import { Effect, Stream } from "effect"
+import { Crypto, Effect, Stream } from "effect"
 import * as AgentProxy from "./AgentProxy.ts"
 import * as Session from "./Session.ts"
-import type { SessionSummary, StoredEvent } from "./Session.ts"
+import type { HistoryItem, SessionSummary } from "./Session.ts"
 
 const ansi = (open: string, close: string) =>
   (text: string): string => `${open}${text}${close}`
@@ -124,7 +124,7 @@ class SessionPicker implements Component, Focusable {
       const title = session.title.replace(/\s+/g, " ")
       lines.push(truncateToWidth(`  ${prefix}${selected ? bold(title) : title}`, width))
       const id = this.showIds ? ` · ${session.sessionId}` : ""
-      lines.push(truncateToWidth(dim(`      ${new Date(session.updatedAt).toLocaleString()} · ${session.messageCount} messages${id}`), width))
+      lines.push(truncateToWidth(dim(`      ${new Date(session.updatedAt).toLocaleString()} · ${session.userCommitCount} User Commits${id}`), width))
     }
     lines.push("", dim("  ↑↓ navigate · enter resume · type search · ctrl+s sort · ctrl+p IDs · esc cancel"), "")
     return lines.map((line) => truncateToWidth(line, width))
@@ -133,10 +133,8 @@ class SessionPicker implements Component, Focusable {
   invalidate(): void {}
 }
 
-type TreeEntryEvent = Session.ConversationEvent
-
-interface TreeEntryItem {
-  readonly event: TreeEntryEvent
+interface HistoryTreeItem {
+  readonly record: Session.BranchRecord
   readonly parentId: string | null
   /** Tree guides are added only where a parent has multiple children. */
   readonly treePrefix: string
@@ -147,31 +145,34 @@ interface TreeEntryItem {
 class TreePicker implements Component, Focusable {
   focused = false
   private selected = 0
-  private readonly items: ReadonlyArray<TreeEntryItem>
+  private readonly items: ReadonlyArray<HistoryTreeItem>
 
   constructor(
-    events: ReadonlyArray<StoredEvent>,
-    private readonly onSelect: (item: TreeEntryItem) => void,
+    history: ReadonlyArray<HistoryItem>,
+    branchHeadId: string | null,
+    private readonly onSelect: (item: HistoryTreeItem) => void,
     private readonly onCancel: () => void,
     private readonly requestRender: () => void
   ) {
-    const tree = Session.conversationTree(events)
-    const byId = new Map(tree.nodes.map((node) => [node.event.eventId, node] as const))
+    const tree = Session.commitGraph(history, branchHeadId)
+    const byId = new Map(tree.nodes.map(
+      (node) => [Session.branchRecordId(node.record), node] as const
+    ))
     const activeIds = new Set<string>()
-    let activeId = tree.leafId
+    let activeId = tree.headId
     while (activeId !== null && !activeIds.has(activeId)) {
       activeIds.add(activeId)
       activeId = byId.get(activeId)?.parentId ?? null
     }
 
-    const children = new Map<string | null, Array<Session.ConversationNode>>()
+    const children = new Map<string | null, Array<Session.CommitNode>>()
     for (const node of tree.nodes) {
       const siblings = children.get(node.parentId) ?? []
       siblings.push(node)
       children.set(node.parentId, siblings)
     }
 
-    const items: Array<TreeEntryItem> = []
+    const items: Array<HistoryTreeItem> = []
     const visit = (parentId: string | null, ancestorGutters: ReadonlyArray<boolean>) => {
       const nodes = children.get(parentId) ?? []
       const branchesHere = nodes.length > 1
@@ -181,16 +182,16 @@ class TreePicker implements Component, Focusable {
           .map((hasLaterSibling) => hasLaterSibling ? "│  " : "   ")
           .join("")
         items.push({
-          event: node.event,
+          record: node.record,
           parentId: node.parentId,
           treePrefix: branchesHere
             ? `${ancestorPrefix}${isLastBranch ? "└─ " : "├─ "}`
             : ancestorPrefix,
-          active: activeIds.has(node.event.eventId),
-          current: node.event.eventId === tree.leafId
+          active: activeIds.has(Session.branchRecordId(node.record)),
+          current: Session.branchRecordId(node.record) === tree.headId
         })
         visit(
-          node.event.eventId,
+          Session.branchRecordId(node.record),
           branchesHere
             ? [...ancestorGutters, !isLastBranch]
             : ancestorGutters
@@ -227,8 +228,8 @@ class TreePicker implements Component, Focusable {
     ))
     const lines = [
       "",
-      bold(cyan("  Conversation Tree")),
-      dim(`  ${this.items.length} messages and tool calls · ● active branch`),
+      bold(cyan("  Commit History")),
+      dim(`  ${this.items.length} Commits and legacy tool records · ● active Branch`),
       ""
     ]
 
@@ -237,11 +238,22 @@ class TreePicker implements Component, Focusable {
       const selected = index === this.selected
       const cursor = selected ? cyan("›") : " "
       const marker = item.current ? green("◆") : item.active ? cyan("●") : dim("○")
-      const [role, rawContent] = item.event.type === "UserMessageAdded"
-        ? [cyan("You"), item.event.payload.content]
-        : item.event.type === "AgentMessageAdded"
-        ? [green("Agent"), item.event.payload.content]
-        : [dim(`Tool · ${item.event.payload.name}`), JSON.stringify(item.event.payload.input)]
+      const [role, rawContent] = item.record.type === "UserCommit"
+        ? [cyan("You"), item.record.content]
+        : item.record.type === "AgentMessageCommit"
+        ? [green("Agent"), item.record.content]
+        : item.record.type === "ToolCommit"
+        ? [
+          dim(`Tool Commit · ${item.record.name}`),
+          JSON.stringify({
+            input: item.record.input,
+            outcome: item.record.outcome
+          })
+        ]
+        : [
+          dim(`Legacy Tool Record · ${item.record.name}`),
+          JSON.stringify({ input: item.record.input, result: "not persisted" })
+        ]
       const content = (rawContent ?? "").replace(/\s+/g, " ").trim() || "(empty)"
       const line = `  ${cursor} ${marker} ${item.treePrefix}${role}: ${content}`
       lines.push(truncateToWidth(selected ? bold(line) : line, width))
@@ -250,7 +262,7 @@ class TreePicker implements Component, Focusable {
     lines.push(
       "",
       dim("  ↑↓ navigate · ←→ page · enter jump · esc cancel"),
-      dim("  Your messages are restored for editing; agent replies and tool calls continue after that point."),
+      dim("  User Commits are restored for editing; other records continue from that Branch Head."),
       ""
     )
     return lines.map((line) => truncateToWidth(line, width))
@@ -267,7 +279,12 @@ interface Handle {
 const formatError = (error: unknown): string =>
   error instanceof Error ? error.message : String(error)
 
-const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialPrompt?: string): Handle => {
+const make = (
+  proxy: AgentProxy.Interface,
+  randomCommitId: Effect.Effect<string, unknown>,
+  initialSessionId: string,
+  initialPrompt?: string
+): Handle => {
   const tui = new TUI(new ProcessTerminal())
   const app = new Container()
   const messages = new Container()
@@ -279,12 +296,17 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
   })
 
   let sessionId = initialSessionId
+  let branchHeadId: string | null = null
   let stopped = false
   let activeController: AbortController | undefined
   let streamController: AbortController | undefined
   let activeLoader: Loader | undefined
-  let pending: { readonly messageId: string; readonly content: string; inReplyTo?: string } | undefined
-  const knownEvents = new Map<string, StoredEvent>()
+  let pending: {
+    readonly commitId: string
+    readonly content: string
+    inReplyTo?: string
+  } | undefined
+  const knownItems = new Map<string, HistoryItem>()
   const errors: Array<string> = []
 
   const header = new Text(
@@ -292,7 +314,7 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
     1,
     1
   )
-  const footer = new Text(dim("Send a message; follow-ups retain the conversation context."), 1, 0)
+  const footer = new Text(dim("Submit a User Commit; follow-ups retain Branch context."), 1, 0)
 
   const showConversation = () => {
     app.clear()
@@ -320,9 +342,9 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
   }
 
   editor.setAutocompleteProvider(new CombinedAutocompleteProvider([
-    { name: "new", description: "Start a new conversation" },
+    { name: "new", description: "Start a new Session" },
     { name: "resume", description: "Resume a previous session" },
-    { name: "tree", description: "Jump to an earlier message and branch" },
+    { name: "history", description: "Check out an earlier Commit" },
     { name: "exit", description: "Exit Corredor" }
   ], process.cwd()))
   editor.setAutocompleteMaxVisible(6)
@@ -339,29 +361,59 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
     messages.addChild(new Spacer(1))
   }
 
-  const addToolCall = (name: string, input: unknown) => {
-    const params = input as { readonly command?: unknown }
-    const detail = name === "Bash" && typeof params.command === "string"
+  const addToolRecord = (
+    record: Extract<Session.BranchRecord, {
+      readonly type: "ToolCommit" | "LegacyToolCall"
+    }>
+  ) => {
+    const params = record.input as { readonly command?: unknown }
+    const detail = record.name === "Bash" && typeof params.command === "string"
       ? JSON.stringify(params.command)
-      : JSON.stringify(input)
-    messages.addChild(new Text(bold(dim(`Tool · ${name}(${detail})`)), 1, 0))
+      : JSON.stringify(record.input)
+    const label = record.type === "ToolCommit"
+      ? "Tool Commit"
+      : "Legacy Tool Record"
+    messages.addChild(
+      new Text(bold(dim(`${label} · ${record.name}(${detail})`)), 1, 0)
+    )
+    if (record.type === "ToolCommit") {
+      const outcome = record.outcome.type === "Success"
+        ? record.outcome.result
+        : record.outcome.failure
+      const outcomeLabel = record.outcome.type === "Success"
+        ? "Result"
+        : "Failure"
+      messages.addChild(new Text(
+        record.outcome.type === "Success"
+          ? dim(`${outcomeLabel}: ${JSON.stringify(outcome)}`)
+          : red(`${outcomeLabel}: ${JSON.stringify(outcome)}`),
+        1,
+        1
+      ))
+    } else {
+      messages.addChild(new Text(dim("Result was not persisted."), 1, 1))
+    }
     messages.addChild(new Spacer(1))
   }
 
-  const orderedEvents = (): ReadonlyArray<StoredEvent> =>
-    [...knownEvents.values()].sort((a, b) => a.sequence - b.sequence)
+  const orderedHistory = (): ReadonlyArray<HistoryItem> =>
+    [...knownItems.values()].sort((a, b) => a.sequence - b.sequence)
 
   const renderMessages = () => {
     messages.clear()
-    const events = orderedEvents()
-    for (const event of Session.conversationBranch(events)) {
-      if (event.type === "UserMessageAdded") addUserMessage(event.payload.content)
-      else if (event.type === "AgentToolCallAdded") addToolCall(event.payload.name, event.payload.input)
-      else addAssistantMessage(event.payload.content)
+    const history = orderedHistory()
+    for (const record of Session.branchHistory(history, branchHeadId)) {
+      if (record.type === "UserCommit") addUserMessage(record.content)
+      else if (record.type === "AgentMessageCommit") {
+        addAssistantMessage(record.content)
+      } else {
+        addToolRecord(record)
+      }
     }
 
-    const pendingIsCommitted = pending !== undefined && events.some(
-      (event) => event.type === "UserMessageAdded" && event.payload.messageId === pending?.messageId
+    const pendingIsCommitted = pending !== undefined && history.some(
+      (item) => item.type === "UserCommit" &&
+        item.commitId === pending?.commitId
     )
     if (pending !== undefined && !pendingIsCommitted) addUserMessage(pending.content)
 
@@ -391,13 +443,23 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
     tui.requestRender()
   }
 
-  const renderEvent = (event: StoredEvent) => {
-    if (knownEvents.has(event.eventId)) return
-    knownEvents.set(event.eventId, event)
+  const renderActivity = (item: HistoryItem) => {
+    const itemId = Session.historyItemId(item)
+    if (knownItems.has(itemId)) return
+    knownItems.set(itemId, item)
+    if (
+      Session.isBranchRecord(item) &&
+      item.parentId === branchHeadId
+    ) {
+      branchHeadId = Session.branchRecordId(item)
+    }
 
-    if (event.type === "UserMessageAdded" && pending?.messageId === event.payload.messageId) {
-      pending.inReplyTo = event.eventId
-    } else if (event.type === "AgentMessageAdded" && pending?.inReplyTo === event.payload.inReplyTo) {
+    if (item.type === "UserCommit" && pending?.commitId === item.commitId) {
+      pending.inReplyTo = item.commitId
+    } else if (
+      item.type === "AgentMessageCommit" &&
+      pending?.inReplyTo === item.inReplyTo
+    ) {
       pending = undefined
       finish()
       return
@@ -410,15 +472,21 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
     const controller = new AbortController()
     streamController = controller
 
-    void Effect.runPromise(proxy.history(id), { signal: controller.signal }).then((history) => {
+    void Effect.runPromise(proxy.history(id), { signal: controller.signal }).then((snapshot) => {
       if (stopped || controller.signal.aborted || streamController !== controller || sessionId !== id) return
-      for (const event of history) knownEvents.set(event.eventId, event)
+      branchHeadId = snapshot.branchHeadId
+      for (const item of snapshot.items) {
+        knownItems.set(Session.historyItemId(item), item)
+      }
       renderMessages()
 
-      const after = history.reduce((position, event) => Math.max(position, event.position), 0)
-      const consume = proxy.streamEvents(id, after).pipe(
-        Stream.runForEach((event) => Effect.sync(() => {
-          if (sessionId === id && !stopped) renderEvent(event)
+      const after = snapshot.items.reduce(
+        (position, item) => Math.max(position, item.position),
+        0
+      )
+      const consume = proxy.streamActivity(id, after).pipe(
+        Stream.runForEach((item) => Effect.sync(() => {
+          if (sessionId === id && !stopped) renderActivity(item)
         }))
       )
       return Effect.runPromise(consume, { signal: controller.signal })
@@ -434,7 +502,8 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
     pending = undefined
     finish()
     sessionId = id
-    knownEvents.clear()
+    branchHeadId = null
+    knownItems.clear()
     errors.length = 0
     editor.setText("")
     renderMessages()
@@ -443,8 +512,8 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
   }
 
   const startNewSession = () => {
-    void Effect.runPromise(proxy.createSession()).then((event) => {
-      switchSession(event.sessionId)
+    void Effect.runPromise(proxy.createSession()).then((session) => {
+      switchSession(session.sessionId)
     }).catch((error: unknown) => {
       addErrorMessage(formatError(error))
       tui.requestRender()
@@ -477,28 +546,37 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
 
   const openTree = () => {
     const treeSessionId = sessionId
-    void Effect.runPromise(proxy.history(treeSessionId)).then((history) => {
+    void Effect.runPromise(proxy.history(treeSessionId)).then((snapshot) => {
       if (stopped || sessionId !== treeSessionId) return
-      for (const event of history) knownEvents.set(event.eventId, event)
-      const hasEntries = Session.conversationTree(history).nodes.length > 0
+      branchHeadId = snapshot.branchHeadId
+      for (const item of snapshot.items) {
+        knownItems.set(Session.historyItemId(item), item)
+      }
+      const hasEntries = Session.commitGraph(
+        snapshot.items,
+        snapshot.branchHeadId
+      ).nodes.length > 0
       if (!hasEntries) {
-        addErrorMessage("There are no messages to navigate yet.")
+        addErrorMessage("There are no Commits to check out yet.")
         return
       }
 
       let navigating = false
       const picker = new TreePicker(
-        history,
+        snapshot.items,
+        snapshot.branchHeadId,
         (item) => {
           if (navigating) return
           navigating = true
-          const targetId = item.event.type === "UserMessageAdded"
+          const targetId = item.record.type === "UserCommit"
             ? item.parentId
-            : item.event.eventId
-          void Effect.runPromise(proxy.navigateTree(treeSessionId, targetId)).then((event) => {
+            : Session.branchRecordId(item.record)
+          void Effect.runPromise(proxy.checkout(treeSessionId, targetId)).then(() => {
             if (stopped || sessionId !== treeSessionId) return
-            knownEvents.set(event.eventId, event)
-            editor.setText(item.event.type === "UserMessageAdded" ? item.event.payload.content : "")
+            branchHeadId = targetId
+            editor.setText(
+              item.record.type === "UserCommit" ? item.record.content : ""
+            )
             renderMessages()
             showConversation()
           }).catch((error: unknown) => {
@@ -527,32 +605,42 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
     if (prompt === "/exit") return stop()
     if (prompt === "/new") return startNewSession()
     if (prompt === "/resume") return resumeSession()
-    if (prompt === "/tree") return openTree()
+    if (prompt === "/history" || prompt === "/tree") return openTree()
 
-    const messageId = crypto.randomUUID()
-    pending = { messageId, content: prompt }
     editor.addToHistory(prompt)
     editor.disableSubmit = true
 
-    const loader = new Loader(tui, cyan, dim, "Thinking...")
-    activeLoader = loader
-    loader.start()
-    renderMessages()
+    void Effect.runPromise(randomCommitId).then((commitId) => {
+      if (stopped) return
+      pending = { commitId, content: prompt }
 
-    const controller = new AbortController()
-    activeController = controller
-    tui.requestRender()
+      const loader = new Loader(tui, cyan, dim, "Thinking...")
+      activeLoader = loader
+      loader.start()
+      renderMessages()
 
-    void Effect.runPromise(
-      proxy.sendMessage(sessionId, messageId, prompt),
-      { signal: controller.signal }
-    ).then((event) => {
-      if (stopped || controller.signal.aborted) return
-      if (activeController === controller) activeController = undefined
-      if (pending?.messageId === messageId) pending.inReplyTo ??= event.eventId
+      const controller = new AbortController()
+      activeController = controller
+      tui.requestRender()
+
+      return Effect.runPromise(
+        proxy.submitUserCommit(sessionId, prompt, commitId),
+        { signal: controller.signal }
+      ).then((commit) => {
+        if (stopped || controller.signal.aborted) return
+        if (activeController === controller) activeController = undefined
+        if (pending?.commitId === commitId) {
+          pending.inReplyTo ??= commit.commitId
+        }
+      }).catch((error: unknown) => {
+        if (stopped || controller.signal.aborted) return
+        if (pending?.commitId === commitId) pending = undefined
+        finish()
+        addErrorMessage(formatError(error))
+        tui.requestRender()
+      })
     }).catch((error: unknown) => {
-      if (stopped || controller.signal.aborted) return
-      if (pending?.messageId === messageId) pending = undefined
+      if (stopped) return
       finish()
       addErrorMessage(formatError(error))
       tui.requestRender()
@@ -583,12 +671,17 @@ const make = (proxy: AgentProxy.Interface, initialSessionId: string, initialProm
 }
 
 export namespace Harness {
-  export const run = (initialPrompt?: string): Effect.Effect<void, never, AgentProxy.Service> =>
+  export const run = (
+    initialPrompt?: string
+  ): Effect.Effect<void, never, AgentProxy.Service | Crypto.Crypto> =>
     Effect.gen(function*() {
       const proxy = yield* AgentProxy.Service
-      const event = yield* proxy.createSession().pipe(Effect.orDie)
+      const crypto = yield* Crypto.Crypto
+      const session = yield* proxy.createSession().pipe(Effect.orDie)
       yield* Effect.acquireUseRelease(
-        Effect.sync(() => make(proxy, event.sessionId, initialPrompt)),
+        Effect.sync(() =>
+          make(proxy, crypto.randomUUIDv4, session.sessionId, initialPrompt)
+        ),
         (handle) => Effect.promise(() => handle.done),
         (handle) => Effect.sync(handle.stop)
       )

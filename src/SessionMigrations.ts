@@ -67,8 +67,25 @@ const allowAgentActivityEvents = Effect.gen(function*() {
     ) WHERE event_type = 'AgentToolCallAdded'`
 })
 
+const addCanonicalCommitsAndLocalHeads = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`CREATE TABLE session_branch_heads (
+    session_id TEXT PRIMARY KEY,
+    commit_id TEXT
+  )`
+  yield* sql`CREATE UNIQUE INDEX session_events_tool_commit_causation
+    ON session_events(
+      json_extract(payload, '$.inReplyTo'),
+      json_extract(payload, '$.index')
+    ) WHERE event_type = 'ToolCommit'`
+  yield* sql`CREATE UNIQUE INDEX session_events_agent_message_causation
+    ON session_events(json_extract(payload, '$.inReplyTo'))
+    WHERE event_type = 'AgentMessageCommit'`
+})
+
 export const loader = SqliteMigrator.fromRecord({
   "1_create_session_events": createSessionEvents,
   "2_create_event_dispatch": createEventDispatch,
-  "3_allow_agent_activity_events": allowAgentActivityEvents
+  "3_allow_agent_activity_events": allowAgentActivityEvents,
+  "4_add_canonical_commits_and_local_heads": addCanonicalCommitsAndLocalHeads
 })
