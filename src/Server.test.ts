@@ -80,6 +80,7 @@ it.live(
       yield* proxy.startAgentRun(
         session.sessionId,
         user.commitId,
+        Agent.defaultDefinition,
         "http-independent-run"
       )
       const independentHistory = yield* proxy.history(session.sessionId)

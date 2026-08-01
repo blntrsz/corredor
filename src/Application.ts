@@ -1,5 +1,6 @@
 import { BunCrypto } from "@effect/platform-bun"
 import { Context, Crypto, Effect, Layer } from "effect"
+import { Agent } from "./Agent.ts"
 import * as AgentRuntime from "./AgentRuntime.ts"
 import * as Session from "./Session.ts"
 
@@ -22,6 +23,7 @@ export interface Interface {
   readonly startAgentRun: (
     sessionId: string,
     startingCommitId: string,
+    definition: Agent.Definition,
     runId?: string
   ) => Effect.Effect<void, Session.Error | Session.PersistenceError>
   readonly checkout: (
@@ -71,8 +73,13 @@ export const make = Effect.gen(function*() {
       }
     ),
     startAgentRun: Effect.fn("Application.startAgentRun")(
-      function*(sessionId: string, startingCommitId: string, runId?: string) {
-        yield* runtime.start(sessionId, startingCommitId, runId)
+      function*(
+        sessionId: string,
+        startingCommitId: string,
+        definition: Agent.Definition,
+        runId?: string
+      ) {
+        yield* runtime.start(sessionId, startingCommitId, definition, runId)
       }
     ),
     checkout: Effect.fn("Application.checkout")(

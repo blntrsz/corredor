@@ -651,6 +651,46 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     return toolEntries.map(branchRecordId).at(-1) ?? inReplyTo
   }
 
+  type ResponseCommitType = "AgentMessageCommit" | "FailureCommit"
+  type ResponseCommitResult =
+    | { readonly type: "NotFound" }
+    | { readonly type: "CommitNotFound"; readonly commitId: string }
+    | { readonly type: "Appended"; readonly item: Commit }
+
+  const appendResponseCommit = (
+    sessionId: string,
+    eventType: ResponseCommitType,
+    inReplyTo: string,
+    runId: string | undefined,
+    payload: Record<string, unknown>,
+    matchesExisting: (item: HistoryItem) => boolean
+  ): Effect.Effect<ResponseCommitResult, PersistenceError> => Effect.gen(function*() {
+    const rows = yield* sessionRows(sessionId)
+    if (rows.length === 0) return { type: "NotFound" as const }
+    const history = decodeHistory(rows)
+    const existing = history.find(matchesExisting)
+    if (existing !== undefined) {
+      return { type: "Appended" as const, item: existing as Commit }
+    }
+    if (!history.some(
+      (item) => isBranchRecord(item) &&
+        branchRecordId(item) === inReplyTo
+    )) {
+      return { type: "CommitNotFound" as const, commitId: inReplyTo }
+    }
+    const parentId = responseParent(history, inReplyTo, runId)
+    const commitId = yield* randomId
+    const item = yield* insert(
+      sessionId,
+      commitId,
+      eventType,
+      { ...payload, parentId, runId },
+      rows.at(-1)!.sequence + 1
+    )
+    yield* updateHeadIfCurrent(sessionId, parentId, commitId)
+    return { type: "Appended" as const, item: item as Commit }
+  }).pipe(sql.withTransaction, persist)
+
   return Service.of({
     check: sql`SELECT 1`.pipe(Effect.asVoid, persist),
     createSession: Effect.fn("Session.createSession")(function*(sessionId) {
@@ -757,39 +797,16 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     }),
     appendAgentMessageCommit: Effect.fn("Session.appendAgentMessageCommit")(
       function*(sessionId, content, inReplyTo, runId) {
-        const result = yield* Effect.gen(function*() {
-          const rows = yield* sessionRows(sessionId)
-          if (rows.length === 0) return { type: "NotFound" as const }
-          const history = decodeHistory(rows)
-          const existing = history.find((item) =>
-            item.type === "AgentMessageCommit" &&
+        const result = yield* appendResponseCommit(
+          sessionId,
+          "AgentMessageCommit",
+          inReplyTo,
+          runId,
+          { content, inReplyTo },
+          (item) => item.type === "AgentMessageCommit" &&
             item.inReplyTo === inReplyTo &&
             item.runId === runId
-          )
-          if (existing !== undefined) {
-            return { type: "Appended" as const, item: existing }
-          }
-          if (!history.some(
-            (item) => isBranchRecord(item) &&
-              branchRecordId(item) === inReplyTo
-          )) {
-            return { type: "CommitNotFound" as const, commitId: inReplyTo }
-          }
-          const parentId = responseParent(history, inReplyTo, runId)
-          const commitId = yield* randomId
-          const item = yield* insert(
-            sessionId,
-            commitId,
-            "AgentMessageCommit",
-            { content, inReplyTo, parentId, runId },
-            rows.at(-1)!.sequence + 1
-          )
-          yield* updateHeadIfCurrent(sessionId, parentId, commitId)
-          return {
-            type: "Appended" as const,
-            item: item as Extract<Commit, { type: "AgentMessageCommit" }>
-          }
-        }).pipe(sql.withTransaction, persist)
+        )
         if (result.type === "NotFound") {
           return yield* new NotFound({ sessionId })
         }
@@ -807,39 +824,16 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     ),
     appendFailureCommit: Effect.fn("Session.appendFailureCommit")(
       function*(sessionId, reason, inReplyTo, runId) {
-        const result = yield* Effect.gen(function*() {
-          const rows = yield* sessionRows(sessionId)
-          if (rows.length === 0) return { type: "NotFound" as const }
-          const history = decodeHistory(rows)
-          const existing = history.find((item) =>
-            item.type === "FailureCommit" &&
+        const result = yield* appendResponseCommit(
+          sessionId,
+          "FailureCommit",
+          inReplyTo,
+          runId,
+          { reason, inReplyTo },
+          (item) => item.type === "FailureCommit" &&
             item.inReplyTo === inReplyTo &&
             item.runId === runId
-          )
-          if (existing !== undefined) {
-            return { type: "Appended" as const, item: existing }
-          }
-          if (!history.some(
-            (item) => isBranchRecord(item) &&
-              branchRecordId(item) === inReplyTo
-          )) {
-            return { type: "CommitNotFound" as const, commitId: inReplyTo }
-          }
-          const parentId = responseParent(history, inReplyTo, runId)
-          const commitId = yield* randomId
-          const item = yield* insert(
-            sessionId,
-            commitId,
-            "FailureCommit",
-            { reason, inReplyTo, parentId, runId },
-            rows.at(-1)!.sequence + 1
-          )
-          yield* updateHeadIfCurrent(sessionId, parentId, commitId)
-          return {
-            type: "Appended" as const,
-            item: item as Extract<Commit, { type: "FailureCommit" }>
-          }
-        }).pipe(sql.withTransaction, persist)
+        )
         if (result.type === "NotFound") {
           return yield* new NotFound({ sessionId })
         }

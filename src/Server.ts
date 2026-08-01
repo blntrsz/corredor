@@ -87,6 +87,7 @@ const startAgentRun = Effect.gen(function*() {
   const request = yield* HttpServerRequest.HttpServerRequest
   const body = yield* Schema.decodeUnknownEffect(Schema.Struct({
     commitId: Schema.String,
+    agent: Agent.DefinitionSchema,
     runId: Schema.optional(Schema.String)
   }))(yield* request.json)
   const sessionId = params.sessionId
@@ -96,7 +97,12 @@ const startAgentRun = Effect.gen(function*() {
       { status: 400 }
     )
   }
-  yield* application.startAgentRun(sessionId, body.commitId, body.runId)
+  yield* application.startAgentRun(
+    sessionId,
+    body.commitId,
+    body.agent,
+    body.runId
+  )
   return HttpServerResponse.jsonUnsafe({
     sessionId,
     commitId: body.commitId,

@@ -5,6 +5,7 @@ import {
   HttpClientRequest,
   HttpClientResponse
 } from "effect/unstable/http"
+import { Agent } from "./Agent.ts"
 import * as Session from "./Session.ts"
 
 export class ProxyError extends Schema.TaggedErrorClass<ProxyError>()(
@@ -27,6 +28,7 @@ export interface Interface {
   readonly startAgentRun: (
     sessionId: string,
     startingCommitId: string,
+    definition: Agent.Definition,
     runId?: string
   ) => Effect.Effect<void, ProxyError>
   readonly listSessions: () => Effect.Effect<
@@ -172,11 +174,17 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
       }
     ),
     startAgentRun: Effect.fn("AgentProxy.startAgentRun")(
-      function*(sessionId: string, startingCommitId: string, runId?: string) {
+      function*(
+        sessionId: string,
+        startingCommitId: string,
+        definition: Agent.Definition,
+        runId?: string
+      ) {
         yield* responseJson(HttpClientRequest.post(
           url(`/v1/sessions/${encodeURIComponent(sessionId)}/runs`)
         ).pipe(HttpClientRequest.bodyJsonUnsafe({
           commitId: startingCommitId,
+          agent: definition,
           ...(runId === undefined ? {} : { runId })
         })))
       }

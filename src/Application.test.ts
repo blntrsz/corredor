@@ -315,9 +315,11 @@ it.live(
   () => Effect.gen(function*() {
     const { path } = yield* temporaryDatabase("corredor-independent-runs-")
     const contexts: Array<ReadonlyArray<Agent.ContextEntry>> = []
+    const definitions: Array<Agent.Definition> = []
     const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
-      run: (context) => Effect.sync(() => {
+      run: (context, _onEvent, definition) => Effect.sync(() => {
         contexts.push(context)
+        definitions.push(definition ?? Agent.defaultDefinition)
         return `response-${contexts.length}`
       })
     }))
@@ -342,11 +344,21 @@ it.live(
       yield* application.startAgentRun(
         session.sessionId,
         user.commitId,
+        {
+          id: "agent-a",
+          instructions: "Use the first definition.",
+          tools: ["Bash"]
+        },
         "independent-run-a"
       )
       yield* application.startAgentRun(
         session.sessionId,
         user.commitId,
+        {
+          id: "agent-b",
+          instructions: "Use the second definition.",
+          tools: ["Bash"]
+        },
         "independent-run-b"
       )
       return yield* application.history(session.sessionId)
@@ -373,6 +385,11 @@ it.live(
       })
     ])
     expect(contexts).toHaveLength(3)
+    expect(definitions.map((definition) => definition.id)).toEqual([
+      "default",
+      "agent-a",
+      "agent-b"
+    ])
     expect(contexts.every((context) => context.map((entry) => entry.type).join() === "User"))
       .toBe(true)
   })

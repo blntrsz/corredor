@@ -9,6 +9,7 @@ export interface Interface {
   readonly start: (
     sessionId: string,
     startingCommitId: string,
+    definition: Agent.Definition,
     runId?: string
   ) => Effect.Effect<void, Session.Error | Session.PersistenceError>
 }
@@ -80,6 +81,7 @@ export const make = Effect.gen(function*() {
   const start = Effect.fn("AgentRuntime.start")(function*(
     sessionId: string,
     startingCommitId: string,
+    definition: Agent.Definition,
     requestedRunId?: string
   ) {
     const runId = requestedRunId
@@ -147,7 +149,8 @@ export const make = Effect.gen(function*() {
           call.index,
           runId
         ).pipe(Effect.asVoid)
-      }
+      },
+      definition
     ), {
       onFailure: (cause) => store.appendFailureCommit(
         sessionId,
@@ -168,7 +171,7 @@ export const make = Effect.gen(function*() {
     item: Session.HistoryItem
   ) {
     if (!isRunnableUserCommit(item)) return
-    yield* start(item.sessionId, item.commitId)
+    yield* start(item.sessionId, item.commitId, Agent.defaultDefinition)
   })
 
   const drain = Effect.fn("AgentRuntime.drain")(function*() {

@@ -58,7 +58,7 @@ curl -X POST http://127.0.0.1:5050/v1/sessions/$SESSION_ID/head \
 # Start another independent Agent Run from an existing Commit.
 curl -X POST http://127.0.0.1:5050/v1/sessions/$SESSION_ID/runs \
   -H 'content-type: application/json' \
-  -d '{"commitId":"COMMIT_ID","runId":"independent-run-id"}'
+  -d '{"commitId":"COMMIT_ID","agent":{"id":"default","instructions":"You are a helpful assistant.","tools":["Bash"]},"runId":"independent-run-id"}'
 ```
 
 ## Commit flow
