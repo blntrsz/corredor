@@ -128,6 +128,59 @@ const addPeerBranchHeads = Effect.gen(function*() {
   yield* sql`DROP TABLE session_branch_heads`
 })
 
+/** Add durable Workstream ownership and metadata for existing Sessions. */
+const addWorkstreams = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`CREATE TABLE workstreams (
+    workstream_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    peer_id TEXT NOT NULL
+  )`
+  yield* sql`CREATE TABLE sessions (
+    session_id TEXT PRIMARY KEY,
+    workstream_id TEXT NOT NULL REFERENCES workstreams(workstream_id),
+    title TEXT NOT NULL DEFAULT 'New session',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    peer_id TEXT NOT NULL
+  )`
+  yield* sql`CREATE INDEX sessions_workstream_id ON sessions (workstream_id, updated_at DESC)`
+
+  yield* sql`INSERT INTO workstreams (
+    workstream_id, name, created_at, updated_at, peer_id
+  )
+  SELECT
+    'default-workstream',
+    'Default Workstream',
+    COALESCE(MIN(occurred_at), '1970-01-01T00:00:00.000Z'),
+    COALESCE(MAX(occurred_at), '1970-01-01T00:00:00.000Z'),
+    'default-peer'
+  FROM session_events
+  WHERE EXISTS (SELECT 1 FROM session_events)`
+
+  yield* sql`INSERT INTO sessions (
+    session_id, workstream_id, title, created_at, updated_at, peer_id
+  )
+  SELECT
+    session_id,
+    'default-workstream',
+    COALESCE(
+      (SELECT json_extract(first.payload, '$.content')
+       FROM session_events first
+       WHERE first.session_id=events.session_id
+         AND first.event_type IN ('UserCommit','UserMessageAdded')
+       ORDER BY first.sequence LIMIT 1),
+      'New session'
+    ),
+    MIN(occurred_at),
+    MAX(occurred_at),
+    'default-peer'
+  FROM session_events events
+  GROUP BY session_id`
+})
+
 export const loader = SqliteMigrator.fromRecord({
   "1_create_session_events": createSessionEvents,
   "2_create_event_dispatch": createEventDispatch,
@@ -135,5 +188,6 @@ export const loader = SqliteMigrator.fromRecord({
   "4_add_canonical_commits_and_local_heads": addCanonicalCommitsAndLocalHeads,
   "5_add_failure_commit_causation": addFailureCommitCausation,
   "6_add_agent_run_identity": addAgentRunIdentity,
-  "7_add_peer_branch_heads": addPeerBranchHeads
+  "7_add_peer_branch_heads": addPeerBranchHeads,
+  "8_add_workstreams": addWorkstreams
 })

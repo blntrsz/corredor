@@ -77,6 +77,7 @@ export interface SessionCreated {
   readonly sequence: number
   readonly position: number
   readonly occurredAt: string
+  readonly workstreamId?: string
 }
 
 export interface LegacyNavigation {
@@ -124,6 +125,8 @@ export interface HistorySnapshot {
 
 /** Used when callers have not configured an explicit Peer identity. */
 export const defaultPeerId = "default-peer"
+export const defaultWorkstreamId = "default-workstream"
+export const defaultWorkstreamName = "Default Workstream"
 
 const historyMetadata = {
   sessionId: Schema.String,
@@ -190,7 +193,8 @@ export const SessionCreatedSchema = Schema.Struct({
   ...historyMetadata,
   type: Schema.Literal("SessionCreated"),
   activityId: Schema.String,
-  occurredAt: Schema.String
+  occurredAt: Schema.String,
+  workstreamId: Schema.optional(Schema.String)
 })
 
 /** Runtime decoder shared by the HTTP client and SSE transport. */
@@ -241,6 +245,14 @@ export class AlreadyExists extends Schema.TaggedErrorClass<AlreadyExists>()(
   "@corredor/Session/AlreadyExists",
   { sessionId: Schema.String }
 ) {}
+export class WorkstreamAlreadyExists extends Schema.TaggedErrorClass<WorkstreamAlreadyExists>()(
+  "@corredor/Session/WorkstreamAlreadyExists",
+  { workstreamId: Schema.String }
+) {}
+export class WorkstreamNotFound extends Schema.TaggedErrorClass<WorkstreamNotFound>()(
+  "@corredor/Session/WorkstreamNotFound",
+  { workstreamId: Schema.String }
+) {}
 export class NotFound extends Schema.TaggedErrorClass<NotFound>()(
   "@corredor/Session/NotFound",
   { sessionId: Schema.String }
@@ -260,12 +272,15 @@ export class ToolCommitConflict extends Schema.TaggedErrorClass<ToolCommitConfli
 export type Error =
   | PersistenceError
   | AlreadyExists
+  | WorkstreamAlreadyExists
+  | WorkstreamNotFound
   | NotFound
   | CommitNotFound
   | ToolCommitConflict
 
 export interface SessionSummary {
   readonly sessionId: string
+  readonly workstreamId: string
   readonly createdAt: string
   readonly updatedAt: string
   readonly title: string
@@ -274,10 +289,46 @@ export interface SessionSummary {
 
 export const SessionSummarySchema = Schema.Struct({
   sessionId: Schema.String,
+  workstreamId: Schema.String,
   createdAt: Schema.String,
   updatedAt: Schema.String,
   title: Schema.String,
   userCommitCount: Schema.Number
+})
+
+export interface Workstream {
+  readonly workstreamId: string
+  readonly name: string
+  readonly createdAt: string
+  readonly updatedAt: string
+  readonly peerId: string
+}
+
+export interface WorkstreamSummary extends Workstream {
+  readonly sessionCount: number
+}
+
+export interface WorkstreamSnapshot {
+  readonly workstream: WorkstreamSummary
+  readonly sessions: ReadonlyArray<SessionSummary>
+}
+
+export const WorkstreamSchema = Schema.Struct({
+  workstreamId: Schema.String,
+  name: Schema.String,
+  createdAt: Schema.String,
+  updatedAt: Schema.String,
+  peerId: Schema.String
+})
+
+export const WorkstreamSummarySchema = Schema.Struct({
+  ...WorkstreamSchema.fields,
+  sessionCount: Schema.Number
+})
+
+export const WorkstreamSnapshotSchema = Schema.Struct({
+  workstream: WorkstreamSummarySchema,
+  sessions: Schema.Array(SessionSummarySchema)
 })
 
 export const isCommit = (item: HistoryItem): item is Commit =>
@@ -392,7 +443,20 @@ export const branchHistory = (
 
 export interface Interface {
   readonly check: Effect.Effect<void, PersistenceError>
-  readonly createSession: (sessionId: string) => Effect.Effect<SessionCreated, Error>
+  readonly createWorkstream: (
+    workstreamId: string,
+    name?: string,
+    peerId?: string
+  ) => Effect.Effect<Workstream, Error>
+  readonly listWorkstreams: () => Effect.Effect<ReadonlyArray<WorkstreamSummary>, PersistenceError>
+  readonly workstream: (
+    workstreamId: string
+  ) => Effect.Effect<WorkstreamSnapshot, PersistenceError | WorkstreamNotFound>
+  readonly createSession: (
+    sessionId: string,
+    workstreamId?: string,
+    peerId?: string
+  ) => Effect.Effect<SessionCreated, Error>
   readonly appendUserCommit: (
     sessionId: string,
     content: string,
@@ -433,7 +497,9 @@ export interface Interface {
     sessionId: string,
     peerId?: string
   ) => Effect.Effect<HistorySnapshot, PersistenceError>
-  readonly listSessions: () => Effect.Effect<ReadonlyArray<SessionSummary>, PersistenceError>
+  readonly listSessions: (
+    workstreamId?: string
+  ) => Effect.Effect<ReadonlyArray<SessionSummary>, PersistenceError>
   readonly activityAfter: (position: number, limit?: number) => Effect.Effect<ReadonlyArray<HistoryItem>, PersistenceError>
   readonly checkpoint: (consumer: string) => Effect.Effect<number, PersistenceError>
   readonly saveCheckpoint: (consumer: string, position: number) => Effect.Effect<void, PersistenceError>
@@ -483,7 +549,10 @@ const decodeHistory = (rows: ReadonlyArray<EventRow>): ReadonlyArray<HistoryItem
         ...metadata,
         type: "SessionCreated",
         activityId: row.event_id,
-        occurredAt: row.occurred_at
+        occurredAt: row.occurred_at,
+        ...(typeof payload.workstreamId === "string"
+          ? { workstreamId: payload.workstreamId }
+          : {})
       })
       continue
     }
@@ -627,6 +696,47 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
   const sessionRows = (sessionId: string) =>
     sql<EventRow>`SELECT d.position, e.* FROM event_dispatch d JOIN session_events e ON e.event_id=d.event_id WHERE e.session_id=${sessionId} ORDER BY e.sequence`
 
+  const sessionSummaryRows = (workstreamId?: string) => workstreamId === undefined
+    ? sql<{
+      readonly sessionId: string
+      readonly workstreamId: string
+      readonly createdAt: string
+      readonly updatedAt: string
+      readonly title: string
+      readonly userCommitCount: number
+    }>`SELECT
+        s.session_id AS sessionId,
+        s.workstream_id AS workstreamId,
+        s.created_at AS createdAt,
+        s.updated_at AS updatedAt,
+        s.title AS title,
+        SUM(CASE WHEN e.event_type IN ('UserCommit','UserMessageAdded') THEN 1 ELSE 0 END)
+          AS userCommitCount
+      FROM sessions s
+      JOIN session_events e ON e.session_id=s.session_id
+      GROUP BY s.session_id
+      ORDER BY s.updated_at DESC`
+    : sql<{
+      readonly sessionId: string
+      readonly workstreamId: string
+      readonly createdAt: string
+      readonly updatedAt: string
+      readonly title: string
+      readonly userCommitCount: number
+    }>`SELECT
+        s.session_id AS sessionId,
+        s.workstream_id AS workstreamId,
+        s.created_at AS createdAt,
+        s.updated_at AS updatedAt,
+        s.title AS title,
+        SUM(CASE WHEN e.event_type IN ('UserCommit','UserMessageAdded') THEN 1 ELSE 0 END)
+          AS userCommitCount
+      FROM sessions s
+      JOIN session_events e ON e.session_id=s.session_id
+      WHERE s.workstream_id=${workstreamId}
+      GROUP BY s.session_id
+      ORDER BY s.updated_at DESC`
+
   // Derive the default Peer's local Branch Head once for legacy Sessions. No
   // legacy row is rewritten, and later Checkout operations update only local
   // Peer state.
@@ -672,6 +782,17 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       payload: JSON.stringify(payload),
       occurred_at: occurredAt
     }
+    const title = (type === "UserCommit" || type === "UserMessageAdded") &&
+        typeof payload.content === "string"
+      ? payload.content
+      : undefined
+    yield* sql`UPDATE sessions
+      SET updated_at=${occurredAt},
+          title=CASE WHEN ${title ?? null} IS NOT NULL AND title='New session'
+            THEN ${title ?? null} ELSE title END
+      WHERE session_id=${sessionId}`
+    yield* sql`UPDATE workstreams SET updated_at=${occurredAt}
+      WHERE workstream_id=(SELECT workstream_id FROM sessions WHERE session_id=${sessionId})`
     return decodeHistory([row])[0]!
   })
 
@@ -752,22 +873,136 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
 
   return Service.of({
     check: sql`SELECT 1`.pipe(Effect.asVoid, persist),
-    createSession: Effect.fn("Session.createSession")(function*(sessionId) {
+    createWorkstream: Effect.fn("Session.createWorkstream")(function*(
+      workstreamId,
+      requestedName = "New Workstream",
+      requestedPeerId = defaultPeerId
+    ) {
+      const result = yield* Effect.gen(function*() {
+        const existing = yield* sql<{ readonly workstreamId: string }>`
+          SELECT workstream_id AS workstreamId FROM workstreams
+          WHERE workstream_id=${workstreamId}`
+        if (existing.length > 0) return { type: "AlreadyExists" as const }
+        const now = new Date(yield* Clock.currentTimeMillis).toISOString()
+        yield* sql`INSERT INTO workstreams (
+          workstream_id, name, created_at, updated_at, peer_id
+        ) VALUES (
+          ${workstreamId}, ${requestedName}, ${now}, ${now}, ${requestedPeerId}
+        )`
+        return {
+          type: "Created" as const,
+          workstream: {
+            workstreamId,
+            name: requestedName,
+            createdAt: now,
+            updatedAt: now,
+            peerId: requestedPeerId
+          } satisfies Workstream
+        }
+      }).pipe(sql.withTransaction, persist)
+      if (result.type === "AlreadyExists") {
+        return yield* new WorkstreamAlreadyExists({ workstreamId })
+      }
+      return result.workstream
+    }),
+    listWorkstreams: Effect.fn("Session.listWorkstreams")(function*() {
+      return yield* sql<{
+        readonly workstreamId: string
+        readonly name: string
+        readonly createdAt: string
+        readonly updatedAt: string
+        readonly peerId: string
+        readonly sessionCount: number
+      }>`SELECT
+        w.workstream_id AS workstreamId,
+        w.name AS name,
+        w.created_at AS createdAt,
+        w.updated_at AS updatedAt,
+        w.peer_id AS peerId,
+        COUNT(s.session_id) AS sessionCount
+      FROM workstreams w
+      LEFT JOIN sessions s ON s.workstream_id=w.workstream_id
+      GROUP BY w.workstream_id
+      ORDER BY w.updated_at DESC`.pipe(persist)
+    }),
+    workstream: Effect.fn("Session.workstream")(function*(workstreamId) {
+      const workstreams = yield* sql<{
+        readonly workstreamId: string
+        readonly name: string
+        readonly createdAt: string
+        readonly updatedAt: string
+        readonly peerId: string
+        readonly sessionCount: number
+      }>`SELECT
+        w.workstream_id AS workstreamId,
+        w.name AS name,
+        w.created_at AS createdAt,
+        w.updated_at AS updatedAt,
+        w.peer_id AS peerId,
+        COUNT(s.session_id) AS sessionCount
+      FROM workstreams w
+      LEFT JOIN sessions s ON s.workstream_id=w.workstream_id
+      WHERE w.workstream_id=${workstreamId}
+      GROUP BY w.workstream_id`.pipe(persist)
+      const summary = workstreams[0]
+      if (summary === undefined) {
+        return yield* new WorkstreamNotFound({ workstreamId })
+      }
+      const sessions = yield* sessionSummaryRows(workstreamId).pipe(
+        Effect.map((rows) => rows.map((row) => ({
+          ...row,
+          title: row.title || "New session"
+        }))),
+        persist
+      )
+      return { workstream: summary, sessions }
+    }),
+    createSession: Effect.fn("Session.createSession")(function*(
+      sessionId,
+      requestedWorkstreamId = defaultWorkstreamId,
+      requestedPeerId = defaultPeerId
+    ) {
       const result = yield* Effect.gen(function*() {
         const rows = yield* sessionRows(sessionId)
         if (rows.length > 0) return { type: "AlreadyExists" as const }
+        const workstreamRows = yield* sql<{
+          readonly workstreamId: string
+        }>`SELECT workstream_id AS workstreamId FROM workstreams
+          WHERE workstream_id=${requestedWorkstreamId}`
+        const now = new Date(yield* Clock.currentTimeMillis).toISOString()
+        if (workstreamRows.length === 0 && requestedWorkstreamId === defaultWorkstreamId) {
+          yield* sql`INSERT INTO workstreams (
+            workstream_id, name, created_at, updated_at, peer_id
+          ) VALUES (
+            ${defaultWorkstreamId}, ${defaultWorkstreamName},
+            ${now}, ${now}, ${requestedPeerId}
+          )`
+        } else if (workstreamRows.length === 0) {
+          return { type: "WorkstreamNotFound" as const }
+        }
+        yield* sql`INSERT INTO sessions (
+          session_id, workstream_id, title, created_at, updated_at, peer_id
+        ) VALUES (
+          ${sessionId}, ${requestedWorkstreamId}, 'New session',
+          ${now}, ${now}, ${requestedPeerId}
+        )`
         const item = yield* insert(
           sessionId,
           yield* randomId,
           "SessionCreated",
-          {},
+          { workstreamId: requestedWorkstreamId },
           1
         )
         yield* sql`INSERT INTO peer_branch_heads (peer_id, session_id, commit_id)
-          VALUES (${defaultPeerId}, ${sessionId}, NULL)`
+          VALUES (${requestedPeerId}, ${sessionId}, NULL)`
         return { type: "Created" as const, item: item as SessionCreated }
       }).pipe(sql.withTransaction, persist)
       if (result.type === "AlreadyExists") return yield* new AlreadyExists({ sessionId })
+      if (result.type === "WorkstreamNotFound") {
+        return yield* new WorkstreamNotFound({
+          workstreamId: requestedWorkstreamId
+        })
+      }
       return result.item
     }),
     appendUserCommit: Effect.fn("Session.appendUserCommit")(
@@ -955,27 +1190,11 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         branchHeadId: heads[0]?.branchHeadId ?? null
       }
     }),
-    listSessions: Effect.fn("Session.listSessions")(function*() {
-      return yield* sql<{
-        readonly sessionId: string
-        readonly createdAt: string
-        readonly updatedAt: string
-        readonly title: string | null
-        readonly userCommitCount: number
-      }>`SELECT
-        session_id AS sessionId,
-        MIN(occurred_at) AS createdAt,
-        MAX(occurred_at) AS updatedAt,
-        (SELECT json_extract(first.payload, '$.content')
-          FROM session_events first
-          WHERE first.session_id=session_events.session_id
-            AND first.event_type IN ('UserCommit','UserMessageAdded')
-          ORDER BY first.sequence LIMIT 1) AS title,
-        SUM(CASE WHEN event_type IN ('UserCommit','UserMessageAdded') THEN 1 ELSE 0 END) AS userCommitCount
-        FROM session_events GROUP BY session_id ORDER BY updatedAt DESC`.pipe(
+    listSessions: Effect.fn("Session.listSessions")(function*(workstreamId) {
+      return yield* sessionSummaryRows(workstreamId).pipe(
         Effect.map((rows) => rows.map((row) => ({
           ...row,
-          title: row.title ?? "New session"
+          title: row.title || "New session"
         }))),
         persist
       )

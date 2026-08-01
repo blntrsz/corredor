@@ -13,6 +13,11 @@ import * as Session from "./Session.ts"
 const peerIdFrom = (request: HttpServerRequest.HttpServerRequest): string =>
   request.headers["x-corredor-peer-id"]?.trim() || Session.defaultPeerId
 
+const internalServerError = () => HttpServerResponse.jsonUnsafe(
+  { error: "internal server error" },
+  { status: 500 }
+)
+
 const health = Session.Service.pipe(
   Effect.flatMap((store) => store.check),
   Effect.match({
@@ -32,18 +37,92 @@ const createSession = Effect.gen(function*() {
   const application = yield* Application.Service
   const request = yield* HttpServerRequest.HttpServerRequest
   const body = yield* Schema.decodeUnknownEffect(Schema.Struct({
-    sessionId: Schema.optional(Schema.String)
+    sessionId: Schema.optional(Schema.String),
+    workstreamId: Schema.optional(Schema.String)
   }))(yield* request.json)
-  const session = yield* application.createSession(body.sessionId)
+  const session = yield* application.createSession(
+    body.sessionId,
+    body.workstreamId,
+    peerIdFrom(request)
+  )
   return HttpServerResponse.jsonUnsafe({ session }, { status: 201 })
-}).pipe(Effect.orDie)
+}).pipe(
+  Effect.catchTag("@corredor/Session/AlreadyExists", (error) => Effect.succeed(
+    HttpServerResponse.jsonUnsafe(
+      { error: `Session already exists: ${error.sessionId}` },
+      { status: 409 }
+    )
+  )),
+  Effect.catchTag("@corredor/Session/WorkstreamNotFound", (error) => Effect.succeed(
+    HttpServerResponse.jsonUnsafe(
+      { error: `Workstream not found: ${error.workstreamId}` },
+      { status: 404 }
+    )
+  )),
+  Effect.catchCause(() => Effect.succeed(internalServerError()))
+)
+
+const createWorkstream = Effect.gen(function*() {
+  const application = yield* Application.Service
+  const request = yield* HttpServerRequest.HttpServerRequest
+  const body = yield* Schema.decodeUnknownEffect(Schema.Struct({
+    workstreamId: Schema.optional(Schema.String),
+    name: Schema.optional(Schema.String)
+  }))(yield* request.json)
+  const workstream = yield* application.createWorkstream(
+    body.workstreamId,
+    body.name,
+    peerIdFrom(request)
+  )
+  return HttpServerResponse.jsonUnsafe({ workstream }, { status: 201 })
+}).pipe(
+  Effect.catchTag("@corredor/Session/WorkstreamAlreadyExists", (error) => Effect.succeed(
+    HttpServerResponse.jsonUnsafe(
+      { error: `Workstream already exists: ${error.workstreamId}` },
+      { status: 409 }
+    )
+  )),
+  Effect.catchCause(() => Effect.succeed(internalServerError()))
+)
+
+const listWorkstreams = Effect.gen(function*() {
+  const application = yield* Application.Service
+  return HttpServerResponse.jsonUnsafe({
+    workstreams: yield* application.listWorkstreams()
+  })
+}).pipe(Effect.catchCause(() => Effect.succeed(internalServerError())))
+
+const inspectWorkstream = Effect.gen(function*() {
+  const application = yield* Application.Service
+  const params = yield* HttpRouter.params
+  const workstreamId = params.workstreamId
+  if (workstreamId === undefined) {
+    return HttpServerResponse.jsonUnsafe(
+      { error: "missing workstream id" },
+      { status: 400 }
+    )
+  }
+  return HttpServerResponse.jsonUnsafe(
+    yield* application.workstream(workstreamId)
+  )
+}).pipe(
+  Effect.catchTag("@corredor/Session/WorkstreamNotFound", (error) => Effect.succeed(
+    HttpServerResponse.jsonUnsafe(
+      { error: `Workstream not found: ${error.workstreamId}` },
+      { status: 404 }
+    )
+  )),
+  Effect.catchCause(() => Effect.succeed(internalServerError()))
+)
 
 const listSessions = Effect.gen(function*() {
   const application = yield* Application.Service
+  const request = yield* HttpServerRequest.HttpServerRequest
+  const workstreamId = new URL(request.originalUrl).searchParams.get("workstreamId") ?? undefined
   return HttpServerResponse.jsonUnsafe({
-    sessions: yield* application.listSessions()
+    sessions: yield* application.listSessions(workstreamId)
   })
-}).pipe(Effect.orDie)
+}).pipe(Effect.catchCause(() => Effect.succeed(internalServerError())))
 
 const submitUserCommit = Effect.gen(function*() {
   const application = yield* Application.Service
@@ -214,6 +293,9 @@ const sessionActivity = Effect.gen(function*() {
 
 const routes = Layer.mergeAll(
   HttpRouter.add("GET", "/v1/health", health),
+  HttpRouter.add("GET", "/v1/workstreams", listWorkstreams),
+  HttpRouter.add("POST", "/v1/workstreams", createWorkstream),
+  HttpRouter.add("GET", "/v1/workstreams/:workstreamId", inspectWorkstream),
   HttpRouter.add("GET", "/v1/sessions", listSessions),
   HttpRouter.add("POST", "/v1/sessions", createSession),
   HttpRouter.add(

@@ -87,6 +87,27 @@ interaction is persisted atomically as one Tool Commit containing its name,
 input, and success result or failure. SSE IDs are durable outbox positions, so
 clients can reconnect with `Last-Event-ID` or `?after=<position>`.
 
+Workstreams group related Sessions. Create one explicitly, or omit
+`workstreamId` when creating a Session to use the migration-safe default
+Workstream:
+
+```bash
+curl -X POST http://127.0.0.1:5050/v1/workstreams \
+  -H 'content-type: application/json' \
+  -d '{"workstreamId":"my-workstream","name":"My Workstream"}'
+
+curl -X POST http://127.0.0.1:5050/v1/sessions \
+  -H 'content-type: application/json' \
+  -d '{"workstreamId":"my-workstream"}'
+
+curl http://127.0.0.1:5050/v1/workstreams/my-workstream
+```
+
+`GET /v1/workstreams` lists Workstreams with Session counts, and the inspect
+endpoint returns the Workstream together with its Session summaries. Existing
+Sessions are linked to `default-workstream` during migration without rewriting
+their history.
+
 Legacy user and Agent messages are projected as canonical Commits when read.
 Legacy tool-call-only and navigation records remain inspectable without
 rewriting their stored rows.
