@@ -61,7 +61,7 @@ it.live("legacy user, agent, tool-call-only, and navigation history remains read
           '{"messageId":"message-2","content":"legacy response","inReplyTo":"user-legacy"}',
           '2026-01-01T00:00:03.000Z'),
         ('navigation-legacy', 'legacy-session', 5, 'SessionTreeNavigated',
-          '{"targetId":"user-legacy"}',
+          '{"targetId":"tool-legacy"}',
           '2026-01-01T00:00:04.000Z');
       INSERT INTO event_dispatch (position, event_id) VALUES
         (1, 'created'),
@@ -94,6 +94,7 @@ it.live("legacy user, agent, tool-call-only, and navigation history remains read
       "AgentMessageCommit",
       "LegacyNavigation"
     ])
+    expect(result.history.branchHeadId).toBe("user-legacy")
     expect(result.history.items[2]).toMatchObject({
       type: "LegacyToolCall",
       legacyId: "tool-legacy",

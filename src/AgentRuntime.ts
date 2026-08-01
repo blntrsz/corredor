@@ -10,7 +10,8 @@ export interface Interface {
     sessionId: string,
     startingCommitId: string,
     definition: Agent.Definition,
-    runId?: string
+    runId?: string,
+    peerId?: string
   ) => Effect.Effect<void, Session.Error | Session.PersistenceError>
 }
 
@@ -82,7 +83,8 @@ export const make = Effect.gen(function*() {
     sessionId: string,
     startingCommitId: string,
     definition: Agent.Definition,
-    requestedRunId?: string
+    requestedRunId?: string,
+    requestedPeerId = Session.defaultPeerId
   ) {
     const runId = requestedRunId
     const snapshot = yield* store.history(sessionId)
@@ -147,7 +149,8 @@ export const make = Effect.gen(function*() {
             : { type: "Success", result: agentEvent.result },
           startingCommitId,
           call.index,
-          runId
+          runId,
+          requestedPeerId
         ).pipe(Effect.asVoid)
       },
       definition
@@ -156,13 +159,15 @@ export const make = Effect.gen(function*() {
         sessionId,
         Cause.pretty(cause),
         startingCommitId,
-        runId
+        runId,
+        requestedPeerId
       ).pipe(Effect.asVoid),
       onSuccess: (response) => store.appendAgentMessageCommit(
         sessionId,
         response,
         startingCommitId,
-        runId
+        runId,
+        requestedPeerId
       ).pipe(Effect.asVoid)
     })
   })
@@ -171,7 +176,13 @@ export const make = Effect.gen(function*() {
     item: Session.HistoryItem
   ) {
     if (!isRunnableUserCommit(item)) return
-    yield* start(item.sessionId, item.commitId, Agent.defaultDefinition)
+    yield* start(
+      item.sessionId,
+      item.commitId,
+      Agent.defaultDefinition,
+      undefined,
+      item.type === "UserCommit" ? item.peerId : undefined
+    )
   })
 
   const drain = Effect.fn("AgentRuntime.drain")(function*() {

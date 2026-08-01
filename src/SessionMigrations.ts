@@ -114,11 +114,26 @@ const addAgentRunIdentity = Effect.gen(function*() {
     ) WHERE event_type = 'FailureCommit'`
 })
 
+/** Branch Heads belong to a Peer and are never synchronized Session facts. */
+const addPeerBranchHeads = Effect.gen(function*() {
+  const sql = yield* SqlClient.SqlClient
+  yield* sql`CREATE TABLE peer_branch_heads (
+    peer_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    commit_id TEXT,
+    PRIMARY KEY (peer_id, session_id)
+  )`
+  yield* sql`INSERT INTO peer_branch_heads (peer_id, session_id, commit_id)
+    SELECT 'default-peer', session_id, commit_id FROM session_branch_heads`
+  yield* sql`DROP TABLE session_branch_heads`
+})
+
 export const loader = SqliteMigrator.fromRecord({
   "1_create_session_events": createSessionEvents,
   "2_create_event_dispatch": createEventDispatch,
   "3_allow_agent_activity_events": allowAgentActivityEvents,
   "4_add_canonical_commits_and_local_heads": addCanonicalCommitsAndLocalHeads,
   "5_add_failure_commit_causation": addFailureCommitCausation,
-  "6_add_agent_run_identity": addAgentRunIdentity
+  "6_add_agent_run_identity": addAgentRunIdentity,
+  "7_add_peer_branch_heads": addPeerBranchHeads
 })

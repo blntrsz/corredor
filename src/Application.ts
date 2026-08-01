@@ -15,7 +15,8 @@ export interface Interface {
   readonly submitUserCommit: (
     sessionId: string,
     content: string,
-    commitId?: string
+    commitId?: string,
+    peerId?: string
   ) => Effect.Effect<
     Extract<Session.Commit, { readonly type: "UserCommit" }>,
     Session.Error
@@ -24,18 +25,21 @@ export interface Interface {
     sessionId: string,
     startingCommitId: string,
     definition: Agent.Definition,
-    runId?: string
+    runId?: string,
+    peerId?: string
   ) => Effect.Effect<void, Session.Error | Session.PersistenceError>
   readonly checkout: (
     sessionId: string,
-    commitId: string | null
+    commitId: string | null,
+    peerId?: string
   ) => Effect.Effect<void, Session.Error>
   readonly listSessions: () => Effect.Effect<
     ReadonlyArray<Session.SessionSummary>,
     Session.PersistenceError
   >
   readonly history: (
-    sessionId: string
+    sessionId: string,
+    peerId?: string
   ) => Effect.Effect<Session.HistorySnapshot, Session.PersistenceError>
   readonly activityAfter: (
     position: number,
@@ -64,11 +68,17 @@ export const make = Effect.gen(function*() {
       }
     ),
     submitUserCommit: Effect.fn("Application.submitUserCommit")(
-      function*(sessionId: string, content: string, requestedId?: string) {
+      function*(
+        sessionId: string,
+        content: string,
+        requestedId?: string,
+        peerId?: string
+      ) {
         return yield* store.appendUserCommit(
           sessionId,
           content,
-          requestedId ?? (yield* randomId)
+          requestedId ?? (yield* randomId),
+          peerId
         )
       }
     ),
@@ -77,21 +87,31 @@ export const make = Effect.gen(function*() {
         sessionId: string,
         startingCommitId: string,
         definition: Agent.Definition,
-        runId?: string
+        runId?: string,
+        peerId?: string
       ) {
-        yield* runtime.start(sessionId, startingCommitId, definition, runId)
+        yield* runtime.start(
+          sessionId,
+          startingCommitId,
+          definition,
+          runId,
+          peerId
+        )
       }
     ),
     checkout: Effect.fn("Application.checkout")(
-      function*(sessionId: string, commitId: string | null) {
-        yield* store.checkout(sessionId, commitId)
+      function*(sessionId: string, commitId: string | null, peerId?: string) {
+        yield* store.checkout(sessionId, commitId, peerId)
       }
     ),
     listSessions: Effect.fn("Application.listSessions")(function*() {
       return yield* store.listSessions()
     }),
-    history: Effect.fn("Application.history")(function*(sessionId: string) {
-      return yield* store.history(sessionId)
+    history: Effect.fn("Application.history")(function*(
+      sessionId: string,
+      peerId?: string
+    ) {
+      return yield* store.history(sessionId, peerId)
     }),
     activityAfter: Effect.fn("Application.activityAfter")(
       function*(position: number, limit?: number) {

@@ -10,6 +10,9 @@ import * as AgentRuntime from "./AgentRuntime.ts"
 import * as Application from "./Application.ts"
 import * as Session from "./Session.ts"
 
+const peerIdFrom = (request: HttpServerRequest.HttpServerRequest): string =>
+  request.headers["x-corredor-peer-id"]?.trim() || Session.defaultPeerId
+
 const health = Session.Service.pipe(
   Effect.flatMap((store) => store.check),
   Effect.match({
@@ -58,10 +61,12 @@ const submitUserCommit = Effect.gen(function*() {
       { status: 400 }
     )
   }
+  const peerId = peerIdFrom(request)
   const commit = yield* application.submitUserCommit(
     sessionId,
     body.content,
-    body.commitId ?? body.messageId
+    body.commitId ?? body.messageId,
+    peerId
   )
   return HttpServerResponse.jsonUnsafe({ commit }, { status: 202 })
 }).pipe(Effect.orDie)
@@ -69,6 +74,7 @@ const submitUserCommit = Effect.gen(function*() {
 const sessionHistory = Effect.gen(function*() {
   const application = yield* Application.Service
   const params = yield* HttpRouter.params
+  const request = yield* HttpServerRequest.HttpServerRequest
   const sessionId = params.sessionId
   if (sessionId === undefined) {
     return HttpServerResponse.jsonUnsafe(
@@ -77,7 +83,7 @@ const sessionHistory = Effect.gen(function*() {
     )
   }
   return HttpServerResponse.jsonUnsafe({
-    history: yield* application.history(sessionId)
+    history: yield* application.history(sessionId, peerIdFrom(request))
   })
 }).pipe(Effect.orDie)
 
@@ -97,11 +103,13 @@ const startAgentRun = Effect.gen(function*() {
       { status: 400 }
     )
   }
+  const peerId = peerIdFrom(request)
   yield* application.startAgentRun(
     sessionId,
     body.commitId,
     body.agent,
-    body.runId
+    body.runId,
+    peerId
   )
   return HttpServerResponse.jsonUnsafe({
     sessionId,
@@ -125,9 +133,11 @@ const checkout = Effect.gen(function*() {
     commitId: Schema.optional(Schema.NullOr(Schema.String)),
     targetId: Schema.optional(Schema.NullOr(Schema.String))
   }))(yield* request.json)
+  const peerId = peerIdFrom(request)
   yield* application.checkout(
     sessionId,
-    body.commitId === undefined ? body.targetId ?? null : body.commitId
+    body.commitId === undefined ? body.targetId ?? null : body.commitId,
+    peerId
   )
   return HttpServerResponse.empty({ status: 204 })
 }).pipe(Effect.orDie)

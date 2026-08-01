@@ -102,9 +102,14 @@ const parseActivityStream = (
   Stream.mapError(proxyError)
 )
 
-export const make = (baseUrl: string) => Effect.gen(function*() {
+export const make = (
+  baseUrl: string,
+  peerId = Session.defaultPeerId
+) => Effect.gen(function*() {
   const client = yield* HttpClient.HttpClient
   const url = (path: string): string => `${baseUrl}${path}`
+  const withPeer = (request: HttpClientRequest.HttpClientRequest) =>
+    request.pipe(HttpClientRequest.setHeader("x-corredor-peer-id", peerId))
 
   const execute = (request: HttpClientRequest.HttpClientRequest) =>
     client.execute(request).pipe(Effect.mapError(proxyError))
@@ -135,11 +140,11 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
 
   const openActivityStream = Effect.fn("AgentProxy.openActivityStream")(
     function*(sessionId: string, after: number) {
-      const request = HttpClientRequest.get(
+      const request = withPeer(HttpClientRequest.get(
         url(
           `/v1/sessions/${encodeURIComponent(sessionId)}/activity?after=${after}`
         )
-      ).pipe(HttpClientRequest.accept("text/event-stream"))
+      ).pipe(HttpClientRequest.accept("text/event-stream")))
       return yield* requireSuccess(yield* execute(request), "Activity stream")
     }
   )
@@ -148,7 +153,7 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
     createSession: Effect.fn("AgentProxy.createSession")(
       function*(sessionId?: string) {
         const body = yield* responseJson(
-          HttpClientRequest.post(url("/v1/sessions")).pipe(
+          withPeer(HttpClientRequest.post(url("/v1/sessions"))).pipe(
             HttpClientRequest.bodyJsonUnsafe(
               sessionId === undefined ? {} : { sessionId }
             )
@@ -162,9 +167,9 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
     ),
     submitUserCommit: Effect.fn("AgentProxy.submitUserCommit")(
       function*(sessionId: string, content: string, commitId: string) {
-        const body = yield* responseJson(HttpClientRequest.post(
+        const body = yield* responseJson(withPeer(HttpClientRequest.post(
           url(`/v1/sessions/${encodeURIComponent(sessionId)}/commits`)
-        ).pipe(HttpClientRequest.bodyJsonUnsafe({ commitId, content })))
+        ).pipe(HttpClientRequest.bodyJsonUnsafe({ commitId, content }))))
         const decoded = yield* Schema.decodeUnknownEffect(CommitResponse)(body)
           .pipe(Effect.mapError(proxyError))
         return decoded.commit as Extract<
@@ -180,13 +185,13 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
         definition: Agent.Definition,
         runId?: string
       ) {
-        yield* responseJson(HttpClientRequest.post(
+        yield* responseJson(withPeer(HttpClientRequest.post(
           url(`/v1/sessions/${encodeURIComponent(sessionId)}/runs`)
         ).pipe(HttpClientRequest.bodyJsonUnsafe({
           commitId: startingCommitId,
           agent: definition,
           ...(runId === undefined ? {} : { runId })
-        })))
+        }))))
       }
     ),
     listSessions: Effect.fn("AgentProxy.listSessions")(function*() {
@@ -198,9 +203,9 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
       return decoded.sessions as ReadonlyArray<Session.SessionSummary>
     }),
     history: Effect.fn("AgentProxy.history")(function*(sessionId: string) {
-      const body = yield* responseJson(HttpClientRequest.get(
+      const body = yield* responseJson(withPeer(HttpClientRequest.get(
         url(`/v1/sessions/${encodeURIComponent(sessionId)}/history`)
-      ))
+      )))
       const decoded = yield* Schema.decodeUnknownEffect(HistoryResponse)(body)
         .pipe(Effect.mapError(proxyError))
       return decoded.history as Session.HistorySnapshot
@@ -209,9 +214,9 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
       sessionId: string,
       commitId: string | null
     ) {
-      yield* requireSuccess(yield* execute(HttpClientRequest.post(
+      yield* requireSuccess(yield* execute(withPeer(HttpClientRequest.post(
         url(`/v1/sessions/${encodeURIComponent(sessionId)}/head`)
-      ).pipe(HttpClientRequest.bodyJsonUnsafe({ commitId }))))
+      ).pipe(HttpClientRequest.bodyJsonUnsafe({ commitId })))))
     }),
     streamActivity: (sessionId, after = 0) => {
       let cursor = after
@@ -233,7 +238,10 @@ export const make = (baseUrl: string) => Effect.gen(function*() {
   })
 })
 
-export const layer = (options: { readonly baseUrl: string }) =>
-  Layer.effect(Service, make(options.baseUrl)).pipe(
+export const layer = (options: {
+  readonly baseUrl: string
+  readonly peerId?: string
+}) =>
+  Layer.effect(Service, make(options.baseUrl, options.peerId)).pipe(
     Layer.provide(FetchHttpClient.layer)
   )
