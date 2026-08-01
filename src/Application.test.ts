@@ -400,6 +400,57 @@ it.live(
 )
 
 it.live(
+  "rejects replayed Tool and Agent outcomes after a Session is settled",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-settlement-outcomes-")
+
+    const result = yield* Effect.gen(function*() {
+      const store = yield* Session.make(path)
+      yield* store.createSession("settlement-outcomes-session")
+      const user = yield* store.appendUserCommit(
+        "settlement-outcomes-session",
+        "Do the work",
+        "settlement-outcomes-user"
+      )
+      yield* store.appendToolCommit(
+        "settlement-outcomes-session",
+        "settlement-outcomes-call",
+        "Lookup",
+        { query: "same" },
+        { type: "Success", result: "done" },
+        user.commitId,
+        0
+      )
+      yield* store.appendAgentMessageCommit(
+        "settlement-outcomes-session",
+        "done",
+        user.commitId
+      )
+      yield* store.settle("settlement-outcomes-session")
+
+      const replayedTool = yield* Effect.flip(store.appendToolCommit(
+        "settlement-outcomes-session",
+        "settlement-outcomes-call",
+        "Lookup",
+        { query: "same" },
+        { type: "Success", result: "done" },
+        user.commitId,
+        0
+      ))
+      const replayedAgent = yield* Effect.flip(store.appendAgentMessageCommit(
+        "settlement-outcomes-session",
+        "done",
+        user.commitId
+      ))
+      return { replayedTool, replayedAgent }
+    }).pipe(Effect.provide(BunCrypto.layer))
+
+    expect(result.replayedTool).toBeInstanceOf(Session.Settled)
+    expect(result.replayedAgent).toBeInstanceOf(Session.Settled)
+  })
+)
+
+it.live(
   "two explicit Agent Runs from one Commit create independent descendants",
   () => Effect.gen(function*() {
     const { path } = yield* temporaryDatabase("corredor-independent-runs-")

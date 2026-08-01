@@ -899,6 +899,39 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     readonly settledAt: string | null
   }>`SELECT settled_at AS settledAt FROM sessions WHERE session_id=${sessionId}`
 
+  type LifecycleTransitionResult =
+    | { readonly type: "NotFound" }
+    | { readonly type: "AlreadySettled" }
+    | { readonly type: "NotSettled" }
+    | { readonly type: "Settled"; readonly item: SessionSettled }
+    | { readonly type: "Reopened"; readonly item: SessionReopened }
+
+  const transitionSession = (
+    sessionId: string,
+    eventType: "SessionSettled" | "SessionReopened"
+  ): Effect.Effect<LifecycleTransitionResult, PersistenceError> => Effect.gen(function*() {
+    const rows = yield* sessionRows(sessionId)
+    if (rows.length === 0) return { type: "NotFound" as const }
+    const state = yield* sessionState(sessionId)
+    const settled = state[0]?.settledAt !== null && state[0]?.settledAt !== undefined
+    if (eventType === "SessionSettled" && settled) {
+      return { type: "AlreadySettled" as const }
+    }
+    if (eventType === "SessionReopened" && !settled) {
+      return { type: "NotSettled" as const }
+    }
+    const item = yield* insert(
+      sessionId,
+      yield* randomId,
+      eventType,
+      {},
+      rows.at(-1)!.sequence + 1
+    )
+    return eventType === "SessionSettled"
+      ? { type: "Settled" as const, item: item as SessionSettled }
+      : { type: "Reopened" as const, item: item as SessionReopened }
+  }).pipe(sql.withTransaction, persist)
+
   const updateHeadIfCurrent = (
     sessionId: string,
     peerId: string,
@@ -945,14 +978,14 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
   ): Effect.Effect<ResponseCommitResult, PersistenceError> => Effect.gen(function*() {
     const rows = yield* sessionRows(sessionId)
     if (rows.length === 0) return { type: "NotFound" as const }
+    const state = yield* sessionState(sessionId)
+    if (state[0]?.settledAt !== null && state[0]?.settledAt !== undefined) {
+      return { type: "Settled" as const }
+    }
     const history = decodeHistory(rows)
     const existing = history.find(matchesExisting)
     if (existing !== undefined) {
       return { type: "Appended" as const, item: existing as Commit }
-    }
-    const state = yield* sessionState(sessionId)
-    if (state[0]?.settledAt !== null && state[0]?.settledAt !== undefined) {
-      return { type: "Settled" as const }
     }
     yield* ensurePeerHead(sessionId, peerId)
     if (!history.some(
@@ -1118,48 +1151,20 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       return result.item
     }),
     settle: Effect.fn("Session.settle")(function*(sessionId) {
-      const result = yield* Effect.gen(function*() {
-        const rows = yield* sessionRows(sessionId)
-        if (rows.length === 0) return { type: "NotFound" as const }
-        const state = yield* sessionState(sessionId)
-        if (state[0]?.settledAt !== null && state[0]?.settledAt !== undefined) {
-          return { type: "AlreadySettled" as const }
-        }
-        const item = yield* insert(
-          sessionId,
-          yield* randomId,
-          "SessionSettled",
-          {},
-          rows.at(-1)!.sequence + 1
-        )
-        return { type: "Settled" as const, item: item as SessionSettled }
-      }).pipe(sql.withTransaction, persist)
+      const result = yield* transitionSession(sessionId, "SessionSettled")
       if (result.type === "NotFound") return yield* new NotFound({ sessionId })
       if (result.type === "AlreadySettled") {
         return yield* new AlreadySettled({ sessionId })
       }
-      return result.item
+      if (result.type === "Settled") return result.item
+      return yield* Effect.die(`Unexpected lifecycle result: ${result.type}`)
     }),
     reopen: Effect.fn("Session.reopen")(function*(sessionId) {
-      const result = yield* Effect.gen(function*() {
-        const rows = yield* sessionRows(sessionId)
-        if (rows.length === 0) return { type: "NotFound" as const }
-        const state = yield* sessionState(sessionId)
-        if (state[0]?.settledAt === null || state[0]?.settledAt === undefined) {
-          return { type: "NotSettled" as const }
-        }
-        const item = yield* insert(
-          sessionId,
-          yield* randomId,
-          "SessionReopened",
-          {},
-          rows.at(-1)!.sequence + 1
-        )
-        return { type: "Reopened" as const, item: item as SessionReopened }
-      }).pipe(sql.withTransaction, persist)
+      const result = yield* transitionSession(sessionId, "SessionReopened")
       if (result.type === "NotFound") return yield* new NotFound({ sessionId })
       if (result.type === "NotSettled") return yield* new NotSettled({ sessionId })
-      return result.item
+      if (result.type === "Reopened") return result.item
+      return yield* Effect.die(`Unexpected lifecycle result: ${result.type}`)
     }),
     appendUserCommit: Effect.fn("Session.appendUserCommit")(
       function*(sessionId, content, commitId, requestedPeerId = defaultPeerId) {
@@ -1211,6 +1216,10 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       const result = yield* Effect.gen(function*() {
         const rows = yield* sessionRows(sessionId)
         if (rows.length === 0) return { type: "NotFound" as const }
+        const state = yield* sessionState(sessionId)
+        if (state[0]?.settledAt !== null && state[0]?.settledAt !== undefined) {
+          return { type: "Settled" as const }
+        }
         const history = decodeHistory(rows)
         const existing = history.find(
           (item): item is Extract<Commit, { readonly type: "ToolCommit" }> =>
@@ -1228,10 +1237,6 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
           return sameInteraction
             ? { type: "Appended" as const, item: existing }
             : { type: "ToolCommitConflict" as const }
-        }
-        const state = yield* sessionState(sessionId)
-        if (state[0]?.settledAt !== null && state[0]?.settledAt !== undefined) {
-          return { type: "Settled" as const }
         }
         yield* ensurePeerHead(sessionId, requestedPeerId)
         if (!history.some(

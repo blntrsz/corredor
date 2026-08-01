@@ -393,6 +393,11 @@ it.live(
         Agent.defaultDefinition
       ))
       const reopened = yield* proxy.reopen(session.sessionId)
+      const continued = yield* proxy.submitUserCommit(
+        session.sessionId,
+        "continue after reopening",
+        "settlement-http-continued"
+      )
       const activity = Array.from(yield* Fiber.join(activityFiber))
       return {
         session,
@@ -405,6 +410,7 @@ it.live(
         commitError,
         runError,
         reopened,
+        continued,
         activity
       }
     }).pipe(Effect.provide(layer))
@@ -425,6 +431,10 @@ it.live(
     expect(result.checkoutError.message).toContain("409")
     expect(result.commitError.message).toContain("409")
     expect(result.runError.message).toContain("409")
+    expect(result.continued).toMatchObject({
+      type: "UserCommit",
+      commitId: "settlement-http-continued"
+    })
     expect(result.activity.map((item) => item.type)).toEqual([
       "SessionSettled",
       "SessionReopened"

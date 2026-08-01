@@ -27,6 +27,32 @@ const internalServerError = () => HttpServerResponse.jsonUnsafe(
   { status: 500 }
 )
 
+const missingSessionId = () => HttpServerResponse.jsonUnsafe(
+  { error: "missing session id" },
+  { status: 400 }
+)
+
+const sessionNotFound = (error: Session.NotFound) => Effect.succeed(
+  HttpServerResponse.jsonUnsafe(
+    { error: `Session not found: ${error.sessionId}` },
+    { status: 404 }
+  )
+)
+
+const sessionSettled = (error: Session.Settled) => Effect.succeed(
+  HttpServerResponse.jsonUnsafe(
+    { error: `Session is settled: ${error.sessionId}` },
+    { status: 409 }
+  )
+)
+
+const commitNotFound = (error: Session.CommitNotFound) => Effect.succeed(
+  HttpServerResponse.jsonUnsafe(
+    { error: `Commit not found: ${error.commitId}` },
+    { status: 404 }
+  )
+)
+
 const health = Session.Service.pipe(
   Effect.flatMap((store) => store.check),
   Effect.match({
@@ -145,10 +171,7 @@ const submitUserCommit = Effect.gen(function*() {
   }))(yield* request.json)
   const sessionId = params.sessionId
   if (sessionId === undefined) {
-    return HttpServerResponse.jsonUnsafe(
-      { error: "missing session id" },
-      { status: 400 }
-    )
+    return missingSessionId()
   }
   const peerId = peerIdFrom(request)
   const commit = yield* application.submitUserCommit(
@@ -159,18 +182,8 @@ const submitUserCommit = Effect.gen(function*() {
   )
   return HttpServerResponse.jsonUnsafe({ commit }, { status: 202 })
 }).pipe(
-  Effect.catchTag("@corredor/Session/NotFound", (error) => Effect.succeed(
-    HttpServerResponse.jsonUnsafe(
-      { error: `Session not found: ${error.sessionId}` },
-      { status: 404 }
-    )
-  )),
-  Effect.catchTag("@corredor/Session/Settled", (error) => Effect.succeed(
-    HttpServerResponse.jsonUnsafe(
-      { error: `Session is settled: ${error.sessionId}` },
-      { status: 409 }
-    )
-  )),
+  Effect.catchTag("@corredor/Session/NotFound", sessionNotFound),
+  Effect.catchTag("@corredor/Session/Settled", sessionSettled),
   Effect.catchCause(() => Effect.succeed(internalServerError()))
 )
 
@@ -180,10 +193,7 @@ const sessionHistory = Effect.gen(function*() {
   const request = yield* HttpServerRequest.HttpServerRequest
   const sessionId = params.sessionId
   if (sessionId === undefined) {
-    return HttpServerResponse.jsonUnsafe(
-      { error: "missing session id" },
-      { status: 400 }
-    )
+    return missingSessionId()
   }
   return HttpServerResponse.jsonUnsafe({
     history: yield* application.history(sessionId, peerIdFrom(request))
@@ -201,10 +211,7 @@ const startAgentRun = Effect.gen(function*() {
   }))(yield* request.json)
   const sessionId = params.sessionId
   if (sessionId === undefined) {
-    return HttpServerResponse.jsonUnsafe(
-      { error: "missing session id" },
-      { status: 400 }
-    )
+    return missingSessionId()
   }
   const peerId = peerIdFrom(request)
   yield* application.startAgentRun(
@@ -220,24 +227,9 @@ const startAgentRun = Effect.gen(function*() {
     runId: body.runId ?? body.commitId
   }, { status: 202 })
 }).pipe(
-  Effect.catchTag("@corredor/Session/NotFound", (error) => Effect.succeed(
-    HttpServerResponse.jsonUnsafe(
-      { error: `Session not found: ${error.sessionId}` },
-      { status: 404 }
-    )
-  )),
-  Effect.catchTag("@corredor/Session/Settled", (error) => Effect.succeed(
-    HttpServerResponse.jsonUnsafe(
-      { error: `Session is settled: ${error.sessionId}` },
-      { status: 409 }
-    )
-  )),
-  Effect.catchTag("@corredor/Session/CommitNotFound", (error) => Effect.succeed(
-    HttpServerResponse.jsonUnsafe(
-      { error: `Commit not found: ${error.commitId}` },
-      { status: 404 }
-    )
-  )),
+  Effect.catchTag("@corredor/Session/NotFound", sessionNotFound),
+  Effect.catchTag("@corredor/Session/Settled", sessionSettled),
+  Effect.catchTag("@corredor/Session/CommitNotFound", commitNotFound),
   Effect.catchCause(() => Effect.succeed(internalServerError()))
 )
 
@@ -247,10 +239,7 @@ const checkout = Effect.gen(function*() {
   const request = yield* HttpServerRequest.HttpServerRequest
   const sessionId = params.sessionId
   if (sessionId === undefined) {
-    return HttpServerResponse.jsonUnsafe(
-      { error: "missing session id" },
-      { status: 400 }
-    )
+    return missingSessionId()
   }
   const body = yield* Schema.decodeUnknownEffect(Schema.Struct({
     commitId: Schema.optional(Schema.NullOr(Schema.String)),
@@ -264,24 +253,9 @@ const checkout = Effect.gen(function*() {
   )
   return HttpServerResponse.empty({ status: 204 })
 }).pipe(
-  Effect.catchTag("@corredor/Session/NotFound", (error) => Effect.succeed(
-    HttpServerResponse.jsonUnsafe(
-      { error: `Session not found: ${error.sessionId}` },
-      { status: 404 }
-    )
-  )),
-  Effect.catchTag("@corredor/Session/Settled", (error) => Effect.succeed(
-    HttpServerResponse.jsonUnsafe(
-      { error: `Session is settled: ${error.sessionId}` },
-      { status: 409 }
-    )
-  )),
-  Effect.catchTag("@corredor/Session/CommitNotFound", (error) => Effect.succeed(
-    HttpServerResponse.jsonUnsafe(
-      { error: `Commit not found: ${error.commitId}` },
-      { status: 404 }
-    )
-  )),
+  Effect.catchTag("@corredor/Session/NotFound", sessionNotFound),
+  Effect.catchTag("@corredor/Session/Settled", sessionSettled),
+  Effect.catchTag("@corredor/Session/CommitNotFound", commitNotFound),
   Effect.catchCause(() => Effect.succeed(internalServerError()))
 )
 
@@ -290,20 +264,12 @@ const settleSession = Effect.gen(function*() {
   const params = yield* HttpRouter.params
   const sessionId = params.sessionId
   if (sessionId === undefined) {
-    return HttpServerResponse.jsonUnsafe(
-      { error: "missing session id" },
-      { status: 400 }
-    )
+    return missingSessionId()
   }
   const event = yield* application.settle(sessionId)
   return HttpServerResponse.jsonUnsafe({ event })
 }).pipe(
-  Effect.catchTag("@corredor/Session/NotFound", (error) => Effect.succeed(
-    HttpServerResponse.jsonUnsafe(
-      { error: `Session not found: ${error.sessionId}` },
-      { status: 404 }
-    )
-  )),
+  Effect.catchTag("@corredor/Session/NotFound", sessionNotFound),
   Effect.catchTag("@corredor/Session/AlreadySettled", (error) => Effect.succeed(
     HttpServerResponse.jsonUnsafe(
       { error: `Session already settled: ${error.sessionId}` },
@@ -318,20 +284,12 @@ const reopenSession = Effect.gen(function*() {
   const params = yield* HttpRouter.params
   const sessionId = params.sessionId
   if (sessionId === undefined) {
-    return HttpServerResponse.jsonUnsafe(
-      { error: "missing session id" },
-      { status: 400 }
-    )
+    return missingSessionId()
   }
   const event = yield* application.reopen(sessionId)
   return HttpServerResponse.jsonUnsafe({ event })
 }).pipe(
-  Effect.catchTag("@corredor/Session/NotFound", (error) => Effect.succeed(
-    HttpServerResponse.jsonUnsafe(
-      { error: `Session not found: ${error.sessionId}` },
-      { status: 404 }
-    )
-  )),
+  Effect.catchTag("@corredor/Session/NotFound", sessionNotFound),
   Effect.catchTag("@corredor/Session/NotSettled", (error) => Effect.succeed(
     HttpServerResponse.jsonUnsafe(
       { error: `Session is not settled: ${error.sessionId}` },
@@ -357,10 +315,7 @@ const sessionActivity = Effect.gen(function*() {
   const request = yield* HttpServerRequest.HttpServerRequest
   const sessionId = params.sessionId
   if (sessionId === undefined) {
-    return HttpServerResponse.jsonUnsafe(
-      { error: "missing session id" },
-      { status: 400 }
-    )
+    return missingSessionId()
   }
 
   const requestedAfter = new URL(request.originalUrl).searchParams.get("after")
