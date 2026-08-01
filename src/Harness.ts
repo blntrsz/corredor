@@ -25,6 +25,14 @@ import type {
   WorkstreamSummary
 } from "./Session.ts"
 
+export const pendingRunMatchesOutcome = (
+  pending: { readonly commitId: string; readonly inReplyTo?: string } | undefined,
+  outcomeInReplyTo: string
+): boolean => pending !== undefined && (
+  pending.inReplyTo === outcomeInReplyTo ||
+  pending.commitId === outcomeInReplyTo
+)
+
 const ansi = (open: string, close: string) =>
   (text: string): string => `${open}${text}${close}`
 
@@ -586,7 +594,7 @@ const make = (
       (item.type === "AgentMessageCommit" ||
         item.type === "FailureCommit" ||
         item.type === "InterruptCommit") &&
-      pending?.inReplyTo === item.inReplyTo
+      pendingRunMatchesOutcome(pending, item.inReplyTo)
     ) {
       branchHeadId = item.commitId
       pending = undefined
