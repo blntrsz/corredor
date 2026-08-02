@@ -267,6 +267,38 @@ const compactSession = Effect.gen(function*() {
   Effect.catchCause(() => Effect.succeed(internalServerError()))
 )
 
+const cherryPick = Effect.gen(function*() {
+  const application = yield* Application.Service
+  const params = yield* HttpRouter.params
+  const request = yield* HttpServerRequest.HttpServerRequest
+  const body = yield* Schema.decodeUnknownEffect(Schema.Struct({
+    sourceSessionId: Schema.optional(Schema.String),
+    sourceCommitId: Schema.optional(Schema.String),
+    commitId: Schema.optional(Schema.String)
+  }))(yield* request.json)
+  const targetSessionId = params.sessionId
+  if (targetSessionId === undefined) return missingSessionId()
+  const sourceCommitId = body.sourceCommitId ?? body.commitId
+  if (sourceCommitId === undefined) {
+    return HttpServerResponse.jsonUnsafe(
+      { error: "missing source commit id" },
+      { status: 400 }
+    )
+  }
+  const commit = yield* application.cherryPick(
+    body.sourceSessionId ?? targetSessionId,
+    sourceCommitId,
+    targetSessionId,
+    peerIdFrom(request)
+  )
+  return HttpServerResponse.jsonUnsafe({ commit }, { status: 201 })
+}).pipe(
+  Effect.catchTag("@corredor/Session/NotFound", sessionNotFound),
+  Effect.catchTag("@corredor/Session/Settled", sessionSettled),
+  Effect.catchTag("@corredor/Session/CommitNotFound", commitNotFound),
+  Effect.catchCause(() => Effect.succeed(internalServerError()))
+)
+
 const interruptAgentRun = Effect.gen(function*() {
   const application = yield* Application.Service
   const params = yield* HttpRouter.params
@@ -462,6 +494,11 @@ const routes = Layer.mergeAll(
     "POST",
     "/v1/sessions/:sessionId/compact",
     compactSession
+  ),
+  HttpRouter.add(
+    "POST",
+    "/v1/sessions/:sessionId/cherry-pick",
+    cherryPick
   ),
   HttpRouter.add(
     "POST",

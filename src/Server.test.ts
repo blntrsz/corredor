@@ -254,6 +254,75 @@ it.live(
 )
 
 it.live(
+  "cherry-picks source context across Sessions through HTTP",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-http-cherry-pick-")
+    const port = yield* Effect.promise(availablePort)
+    const baseUrl = `http://127.0.0.1:${port}`
+    let agentRuns = 0
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: () => Effect.sync(() => {
+        agentRuns += 1
+        return "HTTP source context"
+      })
+    }))
+    const layer = Layer.mergeAll(
+      Server.layerWithoutDependencies({ host: "127.0.0.1", port }),
+      AgentProxy.layer({ baseUrl, peerId: "http-cherry-pick-peer" })
+    ).pipe(
+      Layer.provide(Session.layer(path)),
+      Layer.provide(fakeAgent)
+    )
+
+    const result = yield* Effect.gen(function*() {
+      const proxy = yield* AgentProxy.Service
+      const sourceSession = yield* proxy.createSession("http-cherry-source")
+      yield* proxy.submitUserCommit(
+        sourceSession.sessionId,
+        "Create context for another Session",
+        "http-cherry-user"
+      )
+
+      let sourceHistory = yield* proxy.history(sourceSession.sessionId)
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (sourceHistory.items.some((item) => item.type === "AgentMessageCommit")) break
+        yield* Effect.sleep("10 millis")
+        sourceHistory = yield* proxy.history(sourceSession.sessionId)
+      }
+      const source = sourceHistory.items.find(
+        (item): item is Extract<Session.Commit, { readonly type: "AgentMessageCommit" }> =>
+          item.type === "AgentMessageCommit"
+      )
+      if (source === undefined) {
+        return yield* Effect.die("timed out waiting for HTTP source Agent Message")
+      }
+
+      const targetSession = yield* proxy.createSession("http-cherry-target")
+      const picked = yield* proxy.cherryPick(
+        sourceSession.sessionId,
+        source.commitId,
+        targetSession.sessionId
+      )
+      const targetHistory = yield* proxy.history(targetSession.sessionId)
+      return { sourceSession, source, picked, targetHistory }
+    }).pipe(Effect.provide(layer))
+
+    expect(result.picked).toMatchObject({
+      type: "AgentMessageCommit",
+      parentId: null,
+      content: "HTTP source context",
+      provenance: {
+        workstreamId: Session.defaultWorkstreamId,
+        sessionId: result.sourceSession.sessionId,
+        commitId: result.source.commitId
+      }
+    })
+    expect(result.targetHistory.branchHeadId).toBe(result.picked.commitId)
+    expect(agentRuns).toBe(1)
+  })
+)
+
+it.live(
   "interrupts a streamed Agent Run through the HTTP boundary",
   () => Effect.gen(function*() {
     const { path } = yield* temporaryDatabase("corredor-http-interrupt-")
