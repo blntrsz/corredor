@@ -116,8 +116,9 @@ Create Session -> SessionCreated activity -> durable outbox
 outbox with a global position, and `event_consumer_checkpoints` records durable
 consumer acknowledgements. The server-owned Agent Runtime reacts to User
 Commits and starts each Agent Run statelessly from durable Commit ancestry.
-Explicit runs can start from any existing Commit; provide a distinct `runId`
-to create an independent descendant from the same starting point.
+Explicit runs can start from any existing Commit. Corredor generates and returns
+a distinct `runId` when the caller omits one, so repeated starts from the same
+Commit create independent descendants. Supplying an ID makes a retry idempotent.
 
 The TUI is a thin client. `AgentProxy` creates Sessions and submits User Commits
 over HTTP, then renders the Session's SSE activity stream. It does not open

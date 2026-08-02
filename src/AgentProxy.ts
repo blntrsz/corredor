@@ -11,7 +11,7 @@ import type * as Application from "./Application.ts"
 
 export class ProxyError extends Schema.TaggedErrorClass<ProxyError>()(
   "@corredor/AgentProxy/ProxyError",
-  { message: Schema.String }
+  { message: Schema.String, status: Schema.optional(Schema.Number) }
 ) {}
 
 /** Explicit address and identity of the Peer used for Push/Pull transport. */
@@ -56,7 +56,7 @@ export interface Interface {
     startingCommitId: string,
     definition: Agent.Definition,
     runId?: string
-  ) => Effect.Effect<void, ProxyError>
+  ) => Effect.Effect<Application.AgentRunRef, ProxyError>
   readonly compact: (
     sessionId: string,
     startingCommitId: string,
@@ -134,6 +134,11 @@ const CreateWorkstreamResponse = Schema.Struct({
   workstream: Session.WorkstreamSchema
 })
 const CommitResponse = Schema.Struct({ commit: Session.CommitSchema })
+const AgentRunResponse = Schema.Struct({
+  sessionId: Schema.String,
+  commitId: Schema.String,
+  runId: Schema.String
+})
 const InterruptResponse = Schema.Struct({
   commit: Schema.NullOr(Session.CommitSchema)
 })
@@ -237,7 +242,8 @@ export const make = (
       return yield* new ProxyError({
         message: `${operation} returned ${response.status}${
           detail.length > 0 ? `: ${detail}` : ""
-        }`
+        }`,
+        status: response.status
       })
     }
     return response
@@ -384,13 +390,20 @@ export const make = (
         definition: Agent.Definition,
         runId?: string
       ) {
-        yield* responseJson(withPeer(HttpClientRequest.post(
+        const body = yield* responseJson(withPeer(HttpClientRequest.post(
           url(`/v1/sessions/${encodeURIComponent(sessionId)}/runs`)
         ).pipe(HttpClientRequest.bodyJsonUnsafe({
           commitId: startingCommitId,
           agent: definition,
           ...(runId === undefined ? {} : { runId })
         }))))
+        const decoded = yield* Schema.decodeUnknownEffect(AgentRunResponse)(body)
+          .pipe(Effect.mapError(proxyError))
+        return {
+          sessionId: decoded.sessionId,
+          startingCommitId: decoded.commitId,
+          runId: decoded.runId
+        }
       }
     ),
     compact: Effect.fn("AgentProxy.compact")(

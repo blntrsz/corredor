@@ -219,7 +219,10 @@ const sessionHistory = Effect.gen(function*() {
   return HttpServerResponse.jsonUnsafe({
     history: yield* application.history(sessionId, peerIdFrom(request))
   })
-}).pipe(Effect.orDie)
+}).pipe(
+  Effect.catchTag("@corredor/Session/NotFound", sessionNotFound),
+  Effect.catchCause(() => Effect.succeed(internalServerError()))
+)
 
 const exportBranch = Effect.gen(function*() {
   const application = yield* Application.Service
@@ -279,7 +282,7 @@ const startAgentRun = Effect.gen(function*() {
     return missingSessionId()
   }
   const peerId = peerIdFrom(request)
-  yield* application.startAgentRun(
+  const run = yield* application.startAgentRun(
     sessionId,
     body.commitId,
     body.agent,
@@ -287,9 +290,9 @@ const startAgentRun = Effect.gen(function*() {
     peerId
   )
   return HttpServerResponse.jsonUnsafe({
-    sessionId,
-    commitId: body.commitId,
-    runId: body.runId ?? body.commitId
+    sessionId: run.sessionId,
+    commitId: run.startingCommitId,
+    runId: run.runId
   }, { status: 202 })
 }).pipe(
   Effect.catchTag("@corredor/Session/NotFound", sessionNotFound),

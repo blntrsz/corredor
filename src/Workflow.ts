@@ -159,8 +159,8 @@ const terminalCommit = (item: Session.HistoryItem): item is TerminalCommit =>
   item.type === "FailureCommit" ||
   item.type === "InterruptCommit"
 
-const pollAttempts = 100
-const pollIntervalMillis = 10
+const pollAttempts = 24_000
+const pollIntervalMillis = 25
 
 interface ResolvedInvocation {
   readonly workstreamId: string
@@ -252,7 +252,7 @@ export const make = Effect.gen(function*() {
       peerId: string | undefined,
       agent?: Agent.Definition
     ) {
-      yield* application.startAgentRun(
+      const run = yield* application.startAgentRun(
         sessionId,
         startingCommitId,
         agent ?? invocation.agent,
@@ -266,7 +266,7 @@ export const make = Effect.gen(function*() {
           (item): item is TerminalCommit =>
             terminalCommit(item) &&
             item.inReplyTo === startingCommitId &&
-            item.runId === runId
+            item.runId === run.runId
         )
         if (outcome !== undefined) return outcome
         yield* Effect.sleep(`${pollIntervalMillis} millis`)

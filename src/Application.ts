@@ -38,6 +38,12 @@ export interface IntegrationResult {
   readonly settlement?: Session.SessionSettled
 }
 
+export interface AgentRunRef {
+  readonly sessionId: string
+  readonly startingCommitId: string
+  readonly runId: string
+}
+
 export class InvalidIntegration extends Schema.TaggedErrorClass<InvalidIntegration>()(
   "@corredor/Application/InvalidIntegration",
   {
@@ -105,7 +111,7 @@ export interface Interface {
     definition: Agent.Definition,
     runId?: string,
     peerId?: string
-  ) => Effect.Effect<void, Session.Error | Session.PersistenceError>
+  ) => Effect.Effect<AgentRunRef, Session.Error | Session.PersistenceError>
   readonly compact: (
     sessionId: string,
     startingCommitId: string,
@@ -165,7 +171,7 @@ export interface Interface {
   readonly history: (
     sessionId: string,
     peerId?: string
-  ) => Effect.Effect<Session.HistorySnapshot, Session.PersistenceError>
+  ) => Effect.Effect<Session.HistorySnapshot, Session.PersistenceError | Session.NotFound>
   readonly activityAfter: (
     position: number,
     limit?: number
@@ -185,6 +191,10 @@ export const make = Effect.gen(function*() {
       message: cause.message
     }))
   )
+  const resolveId = (requestedId?: string) =>
+    requestedId === undefined || requestedId.trim().length === 0
+      ? randomId
+      : Effect.succeed(requestedId)
 
   const integrate = Effect.fn("Application.integrate")(function*(
     input: IntegrationInput
@@ -230,7 +240,7 @@ export const make = Effect.gen(function*() {
       input.sourceSessionId,
       input.sourceBranchHeadId,
       input.agent,
-      input.runId,
+      yield* resolveId(input.runId),
       peerId
     ).pipe(
       Effect.catchTag("@corredor/Session/BranchHeadConflict", () =>
@@ -255,7 +265,7 @@ export const make = Effect.gen(function*() {
       )
     )
     const settlement = input.settlement === "integrate and settle"
-      ? yield* store.settle(input.sourceSessionId)
+      ? yield* runtime.settle(input.sourceSessionId)
       : undefined
     return {
       sourceSessionId: input.sourceSessionId,
@@ -272,7 +282,7 @@ export const make = Effect.gen(function*() {
     createWorkstream: Effect.fn("Application.createWorkstream")(
       function*(requestedId?: string, name?: string, peerId?: string) {
         return yield* store.createWorkstream(
-          requestedId ?? (yield* randomId),
+          yield* resolveId(requestedId),
           name,
           peerId
         )
@@ -295,7 +305,7 @@ export const make = Effect.gen(function*() {
         origin?: Session.SessionOrigin
       ) {
         return yield* store.createSession(
-          requestedId ?? (yield* randomId),
+          yield* resolveId(requestedId),
           workstreamId,
           peerId,
           origin
@@ -312,17 +322,17 @@ export const make = Effect.gen(function*() {
         return yield* store.appendUserCommit(
           sessionId,
           content,
-          requestedId ?? (yield* randomId),
+          yield* resolveId(requestedId),
           peerId,
           { autoRun: false }
         )
       }
     ),
     settle: Effect.fn("Application.settle")(function*(sessionId) {
-      return yield* store.settle(sessionId)
+      return yield* runtime.settle(sessionId)
     }),
     reopen: Effect.fn("Application.reopen")(function*(sessionId) {
-      return yield* store.reopen(sessionId)
+      return yield* runtime.reopen(sessionId)
     }),
     submitUserCommit: Effect.fn("Application.submitUserCommit")(
       function*(
@@ -335,7 +345,7 @@ export const make = Effect.gen(function*() {
         return yield* store.appendUserCommit(
           sessionId,
           content,
-          requestedId ?? (yield* randomId),
+          yield* resolveId(requestedId),
           peerId,
           options
         )
@@ -349,13 +359,16 @@ export const make = Effect.gen(function*() {
         runId?: string,
         peerId?: string
       ) {
+        const effectiveRunId = yield* resolveId(runId)
         yield* runtime.start(
           sessionId,
           startingCommitId,
           definition,
-          runId,
-          peerId
+          effectiveRunId,
+          peerId,
+          false
         )
+        return { sessionId, startingCommitId, runId: effectiveRunId }
       }
     ),
     compact: Effect.fn("Application.compact")(
@@ -370,7 +383,7 @@ export const make = Effect.gen(function*() {
           sessionId,
           startingCommitId,
           definition,
-          runId,
+          yield* resolveId(runId),
           peerId
         )
       }

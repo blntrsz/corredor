@@ -84,11 +84,34 @@ it.live(
         Agent.defaultDefinition,
         "http-independent-run"
       )
-      const independentHistory = yield* proxy.history(session.sessionId)
+      const generatedRun = yield* proxy.startAgentRun(
+        session.sessionId,
+        user.commitId,
+        Agent.defaultDefinition
+      )
+      let independentHistory = yield* proxy.history(session.sessionId)
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const completedRuns = independentHistory.items.filter(
+          (item) => item.type === "AgentMessageCommit" &&
+            (item.runId === "http-independent-run" ||
+              item.runId === generatedRun.runId)
+        )
+        if (completedRuns.length === 2) break
+        yield* Effect.sleep("10 millis")
+        independentHistory = yield* proxy.history(session.sessionId)
+      }
       yield* proxy.checkout(session.sessionId, user.commitId)
       const checkedOut = yield* proxy.history(session.sessionId)
       const sessions = yield* proxy.listSessions()
-      return { user, activity, history, independentHistory, checkedOut, sessions }
+      return {
+        user,
+        activity,
+        history,
+        generatedRun,
+        independentHistory,
+        checkedOut,
+        sessions
+      }
     }).pipe(Effect.provide(layer))
 
     expect(result.user).toMatchObject({
@@ -140,6 +163,16 @@ it.live(
       runId: "http-independent-run",
       parentId: (independentTool as Session.Commit).commitId
     })
+    expect(result.generatedRun).toMatchObject({
+      sessionId: "http-session",
+      startingCommitId: "http-user"
+    })
+    expect(result.generatedRun.runId).not.toBe("http-user")
+    expect(result.independentHistory.items).toContainEqual(expect.objectContaining({
+      type: "AgentMessageCommit",
+      inReplyTo: "http-user",
+      runId: result.generatedRun.runId
+    }))
     expect(result.checkedOut.branchHeadId).toBe("http-user")
     expect(result.checkedOut.items).toEqual(result.independentHistory.items)
     expect(result.sessions).toEqual([
