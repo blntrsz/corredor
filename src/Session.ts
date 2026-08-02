@@ -780,7 +780,7 @@ export interface Interface {
   readonly history: (
     sessionId: string,
     peerId?: string
-  ) => Effect.Effect<HistorySnapshot, PersistenceError>
+  ) => Effect.Effect<HistorySnapshot, PersistenceError | NotFound>
   readonly listSessions: (
     workstreamId?: string,
     view?: SessionListView
@@ -2662,6 +2662,7 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       requestedPeerId = defaultPeerId
     ) {
       const rows = yield* sessionRows(sessionId).pipe(persist)
+      if (rows.length === 0) return yield* new NotFound({ sessionId })
       yield* ensurePeerHead(sessionId, requestedPeerId).pipe(persist)
       const heads = yield* sql<{ readonly branchHeadId: string | null }>`
         SELECT commit_id AS branchHeadId

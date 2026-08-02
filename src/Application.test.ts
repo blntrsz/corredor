@@ -1,6 +1,6 @@
 import { expect, it } from "@effect/vitest"
 import { BunCrypto } from "@effect/platform-bun"
-import { Effect, Layer } from "effect"
+import { Effect, Fiber, Layer } from "effect"
 import { Agent } from "./Agent.ts"
 import * as AgentRuntime from "./AgentRuntime.ts"
 import * as Application from "./Application.ts"
@@ -803,6 +803,330 @@ it.live(
     ])
     expect(contexts.every((context) => context.map((entry) => entry.type).join() === "User"))
       .toBe(true)
+  })
+)
+
+it.live(
+  "generates distinct identities for explicit Agent Runs when callers omit them",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-generated-run-ids-")
+    let executions = 0
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: () => Effect.sync(() => `response-${++executions}`)
+    }))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const session = yield* application.createSession("generated-run-session")
+      const root = yield* application.createRootContext(
+        session.sessionId,
+        "Run twice",
+        "generated-run-root"
+      )
+      const first = yield* application.startAgentRun(
+        session.sessionId,
+        root.commitId,
+        Agent.defaultDefinition
+      )
+      const second = yield* application.startAgentRun(
+        session.sessionId,
+        root.commitId,
+        Agent.defaultDefinition
+      )
+      return {
+        first,
+        second,
+        history: yield* application.history(session.sessionId)
+      }
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    expect(result.first.runId).not.toBe(result.second.runId)
+    expect(result.history.items.filter(
+      (item) => item.type === "AgentMessageCommit"
+    )).toEqual([
+      expect.objectContaining({ runId: result.first.runId }),
+      expect.objectContaining({ runId: result.second.runId })
+    ])
+    expect(executions).toBe(2)
+  })
+)
+
+it.live(
+  "returns a generated Run ID before completion and rejects identity collisions",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-immediate-run-id-")
+    let markStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve
+    })
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (_context, onEvent) => Effect.gen(function*() {
+        yield* onEvent({ type: "TextDelta", text: "partial" })
+        markStarted()
+        yield* Effect.promise(() => new Promise<void>(() => undefined))
+        return "unreachable"
+      })
+    }))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const session = yield* application.createSession("immediate-run-session")
+      const root = yield* application.createRootContext(
+        session.sessionId,
+        "Long-running explicit work",
+        "immediate-run-root"
+      )
+      const run = yield* application.startAgentRun(
+        session.sessionId,
+        root.commitId,
+        Agent.defaultDefinition
+      )
+      yield* Effect.promise(() => started)
+      const collision = yield* Effect.flip(application.compact(
+        session.sessionId,
+        root.commitId,
+        Agent.defaultDefinition,
+        run.runId
+      ))
+      const interrupt = yield* application.interruptAgentRun(
+        session.sessionId,
+        root.commitId,
+        "Stop generated Run",
+        run.runId
+      )
+      return { run, collision, interrupt }
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    expect(result.run.runId.length).toBeGreaterThan(0)
+    expect(result.collision).toBeInstanceOf(Session.PersistenceError)
+    expect(result.interrupt).toMatchObject({
+      type: "InterruptCommit",
+      reason: "Stop generated Run",
+      runId: result.run.runId
+    })
+  })
+)
+
+it.live(
+  "interrupts active Agent Runs before settling and admits new Runs after reopening",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-settle-active-run-")
+    let markStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve
+    })
+    let executions = 0
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (_context, onEvent) => {
+        executions++
+        if (executions > 1) return Effect.succeed("completed after reopening")
+        return Effect.gen(function*() {
+          yield* onEvent({ type: "TextDelta", text: "visible partial" })
+          markStarted()
+          yield* Effect.promise(() => new Promise<void>(() => undefined))
+          return "unreachable"
+        })
+      }
+    }))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const session = yield* application.createSession("settle-active-run-session")
+      const root = yield* application.createRootContext(
+        session.sessionId,
+        "Long-running work",
+        "settle-active-run-root"
+      )
+      const runFiber = yield* application.startAgentRun(
+        session.sessionId,
+        root.commitId,
+        Agent.defaultDefinition
+      ).pipe(Effect.forkScoped)
+      yield* Effect.promise(() => started)
+      const settled = yield* application.settle(session.sessionId)
+      const interruptedRun = yield* Fiber.join(runFiber)
+      const settledHistory = yield* application.history(session.sessionId)
+      yield* application.reopen(session.sessionId)
+      const resumedRun = yield* application.startAgentRun(
+        session.sessionId,
+        root.commitId,
+        Agent.defaultDefinition
+      )
+      const reopenedHistory = yield* application.history(session.sessionId)
+      return {
+        settled,
+        interruptedRun,
+        resumedRun,
+        settledHistory,
+        reopenedHistory
+      }
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    const interrupt = result.settledHistory.items.find(
+      (item) => item.type === "InterruptCommit"
+    )
+    expect(interrupt).toMatchObject({
+      reason: "Session settled",
+      partialOutput: "visible partial",
+      runId: result.interruptedRun.runId
+    })
+    expect(interrupt?.sequence).toBeLessThan(result.settled.sequence)
+    expect(result.settledHistory.settled).toBe(true)
+    expect(result.reopenedHistory.settled).toBe(false)
+    expect(result.reopenedHistory.items).toContainEqual(expect.objectContaining({
+      type: "AgentMessageCommit",
+      content: "completed after reopening",
+      runId: result.resumedRun.runId
+    }))
+  })
+)
+
+it.live(
+  "waits for an active Compaction outcome before settling",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-settle-compaction-")
+    let markStarted!: () => void
+    let releaseCompaction!: () => void
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve
+    })
+    const released = new Promise<void>((resolve) => {
+      releaseCompaction = resolve
+    })
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: () => Effect.gen(function*() {
+        markStarted()
+        yield* Effect.promise(() => released)
+        return "durable summary"
+      })
+    }))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const session = yield* application.createSession("settle-compaction-session")
+      const root = yield* application.createRootContext(
+        session.sessionId,
+        "Compact this",
+        "settle-compaction-root"
+      )
+      const compactionFiber = yield* application.compact(
+        session.sessionId,
+        root.commitId
+      ).pipe(Effect.forkScoped)
+      yield* Effect.promise(() => started)
+      let settlementCompleted = false
+      const settlementFiber = yield* application.settle(session.sessionId).pipe(
+        Effect.tap(() => Effect.sync(() => {
+          settlementCompleted = true
+        })),
+        Effect.forkScoped
+      )
+      yield* Effect.sleep("20 millis")
+      expect(settlementCompleted).toBe(false)
+      releaseCompaction()
+      const compaction = yield* Fiber.join(compactionFiber)
+      const settled = yield* Fiber.join(settlementFiber)
+      return {
+        compaction,
+        settled,
+        history: yield* application.history(session.sessionId)
+      }
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    expect(result.compaction.type).toBe("CompactionCommit")
+    expect(result.compaction.sequence).toBeLessThan(result.settled.sequence)
+    expect(result.history.settled).toBe(true)
+  })
+)
+
+it.live(
+  "clears the Settlement admission gate when waiting is interrupted",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-cancel-settlement-")
+    let markCompactionStarted!: () => void
+    let releaseCompaction!: () => void
+    const compactionStarted = new Promise<void>((resolve) => {
+      markCompactionStarted = resolve
+    })
+    const compactionReleased = new Promise<void>((resolve) => {
+      releaseCompaction = resolve
+    })
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (_context, _onEvent, definition) =>
+        definition?.tools.length === 0
+          ? Effect.gen(function*() {
+            markCompactionStarted()
+            yield* Effect.promise(() => compactionReleased)
+            return "summary after release"
+          })
+          : Effect.succeed("new Run admitted")
+    }))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const session = yield* application.createSession("cancel-settlement-session")
+      const root = yield* application.createRootContext(
+        session.sessionId,
+        "Keep active",
+        "cancel-settlement-root"
+      )
+      const compactionFiber = yield* application.compact(
+        session.sessionId,
+        root.commitId
+      ).pipe(Effect.forkScoped)
+      yield* Effect.promise(() => compactionStarted)
+      const settlementFiber = yield* application.settle(session.sessionId).pipe(
+        Effect.forkScoped
+      )
+      yield* Effect.sleep("20 millis")
+      yield* Fiber.interrupt(settlementFiber)
+      releaseCompaction()
+      yield* Fiber.join(compactionFiber)
+      const run = yield* application.startAgentRun(
+        session.sessionId,
+        root.commitId,
+        Agent.defaultDefinition
+      )
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const history = yield* application.history(session.sessionId)
+        if (history.items.some(
+          (item) => item.type === "AgentMessageCommit" &&
+            item.runId === run.runId
+        )) return { run, history }
+        yield* Effect.sleep("10 millis")
+      }
+      return yield* Effect.die("timed out waiting for admitted Agent Run")
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    expect(result.history.settled).toBe(false)
+    expect(result.history.items).toContainEqual(expect.objectContaining({
+      type: "AgentMessageCommit",
+      content: "new Run admitted",
+      runId: result.run.runId
+    }))
+  })
+)
+
+it.live(
+  "rejects unknown Session history without preventing later creation",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-missing-history-")
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: () => Effect.succeed("unused")
+    }))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const error = yield* Effect.flip(application.history("missing-session"))
+      const created = yield* application.createSession("missing-session")
+      return { error, created }
+    }).pipe(Effect.provide(runtimeLayer(path, fakeAgent)))
+
+    expect(result.error).toBeInstanceOf(Session.NotFound)
+    expect(result.created).toMatchObject({
+      type: "SessionCreated",
+      sessionId: "missing-session"
+    })
   })
 )
 

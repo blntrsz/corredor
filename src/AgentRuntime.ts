@@ -1,4 +1,4 @@
-import { Cause, Context, Deferred, Effect, Layer } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { Agent } from "./Agent.ts"
 import * as Session from "./Session.ts"
 
@@ -11,7 +11,8 @@ export interface Interface {
     startingCommitId: string,
     definition: Agent.Definition,
     runId?: string,
-    peerId?: string
+    peerId?: string,
+    waitForOutcome?: boolean
   ) => Effect.Effect<void, Session.Error | Session.PersistenceError>
   /** Summarizes the selected Branch into one durable Compaction Commit. */
   readonly compact: (
@@ -34,6 +35,14 @@ export interface Interface {
     Extract<Session.Commit, { readonly type: "InterruptCommit" }> | undefined,
     Session.Error | Session.PersistenceError
   >
+  /** Records terminal outcomes for active runs before settling the Session. */
+  readonly settle: (
+    sessionId: string
+  ) => Effect.Effect<Session.SessionSettled, Session.Error | Session.PersistenceError>
+  /** Reopens the Session and admits new Agent Runs again. */
+  readonly reopen: (
+    sessionId: string
+  ) => Effect.Effect<Session.SessionReopened, Session.Error | Session.PersistenceError>
 }
 
 export class Service extends Context.Service<Service, Interface>()(
@@ -163,6 +172,7 @@ const agentContext = (
 export const make = Effect.gen(function*() {
   const store = yield* Session.Service
   const agent = yield* Agent.Service
+  const runtimeScope = yield* Effect.scope
 
   type InterruptRequest = {
     readonly reason: string
@@ -179,8 +189,30 @@ export const make = Effect.gen(function*() {
     readonly completed: Deferred.Deferred<InterruptCommit | undefined>
     partialOutput: string
   }
+  interface ActiveCompaction {
+    readonly sessionId: string
+    readonly startingCommitId: string
+    readonly runId?: string
+    readonly completed: Deferred.Deferred<void>
+  }
 
   const activeRuns = new Map<string, ActiveRun>()
+  const activeCompactions = new Map<string, ActiveCompaction>()
+  const completedOperationKinds = new Map<string, "normal" | "compaction">()
+  const rememberOperationKind = (
+    key: string,
+    kind: "normal" | "compaction"
+  ): void => {
+    completedOperationKinds.set(key, kind)
+    if (completedOperationKinds.size <= 1_024) return
+    const oldest = completedOperationKinds.keys().next().value
+    if (oldest !== undefined) completedOperationKinds.delete(oldest)
+  }
+  const settlingSessions = new Set<string>()
+  const settlementStates = new Map<string, {
+    attempts: number
+    settled: boolean
+  }>()
   const runKey = (
     sessionId: string,
     startingCommitId: string,
@@ -192,8 +224,12 @@ export const make = Effect.gen(function*() {
     startingCommitId: string,
     definition: Agent.Definition,
     requestedRunId?: string,
-    requestedPeerId = Session.defaultPeerId
+    requestedPeerId = Session.defaultPeerId,
+    waitForOutcome = true
   ) {
+    if (settlingSessions.has(sessionId)) {
+      return yield* new Session.Settled({ sessionId })
+    }
     const runId = requestedRunId
     const snapshot = yield* store.history(sessionId)
     if (snapshot.settled) {
@@ -217,6 +253,11 @@ export const make = Effect.gen(function*() {
       candidate.inReplyTo === startingCommitId &&
       candidate.runId === runId
     )
+    if (existingOutcome?.type === "CompactionCommit") {
+      return yield* new Session.PersistenceError({
+        message: `Agent Run ${runId ?? "<legacy>"} already completed as a Compaction`
+      })
+    }
     if (existingOutcome !== undefined) return
 
     const request = yield* Deferred.make<InterruptRequest>()
@@ -230,6 +271,21 @@ export const make = Effect.gen(function*() {
       partialOutput: ""
     }
     const key = runKey(sessionId, startingCommitId, runId)
+    // Settlement may have begun while durable context was being loaded.
+    if (settlingSessions.has(sessionId)) {
+      return yield* new Session.Settled({ sessionId })
+    }
+    if (activeCompactions.has(key)) {
+      return yield* new Session.PersistenceError({
+        message: `Agent Run ${runId ?? "<legacy>"} is active as a Compaction`
+      })
+    }
+    if (completedOperationKinds.get(key) === "compaction") {
+      return yield* new Session.PersistenceError({
+        message: `Agent Run ${runId ?? "<legacy>"} already completed as a Compaction`
+      })
+    }
+    if (completedOperationKinds.get(key) === "normal") return
     if (activeRuns.has(key)) return
     activeRuns.set(key, active)
 
@@ -253,7 +309,7 @@ export const make = Effect.gen(function*() {
     }>()
     let nextToolIndex = (durableToolCommits.at(-1)?.index ?? -1) + 1
 
-    yield* Effect.ensuring(
+    const fiber = yield* Effect.forkIn(Effect.ensuring(
       Effect.matchCauseEffect(
         Effect.raceFirst(
           agent.run(
@@ -310,7 +366,12 @@ export const make = Effect.gen(function*() {
                 startingCommitId,
                 runId,
                 requestedPeerId
-              ).pipe(Effect.asVoid)
+              ).pipe(
+                Effect.tap(() => Effect.sync(() => {
+                  rememberOperationKind(key, "normal")
+                })),
+                Effect.asVoid
+              )
             )
           },
           onSuccess: (outcome) => outcome.type === "Interrupted"
@@ -325,6 +386,7 @@ export const make = Effect.gen(function*() {
               ).pipe(
                 Effect.tap((commit) => Effect.sync(() => {
                   interruptCommit = commit
+                  rememberOperationKind(key, "normal")
                 })),
                 Effect.asVoid
               )
@@ -336,7 +398,12 @@ export const make = Effect.gen(function*() {
                 startingCommitId,
                 runId,
                 requestedPeerId
-              ).pipe(Effect.asVoid)
+              ).pipe(
+                Effect.tap(() => Effect.sync(() => {
+                  rememberOperationKind(key, "normal")
+                })),
+                Effect.asVoid
+              )
             )
         }
       ),
@@ -344,7 +411,8 @@ export const make = Effect.gen(function*() {
         activeRuns.delete(key)
         yield* Deferred.succeed(completed, interruptCommit)
       })
-    )
+    ), runtimeScope, { startImmediately: true })
+    if (waitForOutcome) yield* Fiber.join(fiber)
   })
 
   const compact: Interface["compact"] = Effect.fn("AgentRuntime.compact")(
@@ -355,6 +423,9 @@ export const make = Effect.gen(function*() {
       requestedRunId?: string,
       requestedPeerId = Session.defaultPeerId
     ) {
+      if (settlingSessions.has(sessionId)) {
+        return yield* new Session.Settled({ sessionId })
+      }
       const snapshot = yield* store.history(sessionId)
       if (snapshot.settled) {
         return yield* new Session.Settled({ sessionId })
@@ -385,39 +456,105 @@ export const make = Effect.gen(function*() {
         })
       }
 
+      const key = runKey(sessionId, startingCommitId, requestedRunId)
+      const completed = yield* Deferred.make<void>()
+      if (settlingSessions.has(sessionId)) {
+        return yield* new Session.Settled({ sessionId })
+      }
+      const existingCompaction = activeCompactions.get(key)
+      if (existingCompaction !== undefined) {
+        yield* Deferred.await(existingCompaction.completed)
+        const refreshed = yield* store.history(sessionId)
+        const outcome = refreshed.items.find(
+          (item): item is Extract<
+            Session.Commit,
+            { readonly type: "CompactionCommit" }
+          > => item.type === "CompactionCommit" &&
+            item.inReplyTo === startingCommitId &&
+            item.runId === requestedRunId
+        )
+        if (outcome !== undefined) return outcome
+        return yield* new Session.PersistenceError({
+          message: `Compaction Agent Run failed for ${startingCommitId}`
+        })
+      }
+      if (activeRuns.has(key)) {
+        return yield* new Session.PersistenceError({
+          message: `Agent Run ${requestedRunId ?? "<legacy>"} is active as a normal Run`
+        })
+      }
+      if (completedOperationKinds.get(key) === "normal") {
+        return yield* new Session.PersistenceError({
+          message: `Agent Run ${requestedRunId ?? "<legacy>"} already completed as a normal Run`
+        })
+      }
+      if (completedOperationKinds.get(key) === "compaction") {
+        const refreshed = yield* store.history(sessionId)
+        const outcome = refreshed.items.find(
+          (item): item is Extract<
+            Session.Commit,
+            { readonly type: "CompactionCommit" }
+          > => item.type === "CompactionCommit" &&
+            item.inReplyTo === startingCommitId &&
+            item.runId === requestedRunId
+        )
+        if (outcome !== undefined) return outcome
+        return yield* new Session.PersistenceError({
+          message: `Compaction Agent Run failed for ${startingCommitId}`
+        })
+      }
+      const active: ActiveCompaction = {
+        sessionId,
+        startingCommitId,
+        runId: requestedRunId,
+        completed
+      }
+      activeCompactions.set(key, active)
+
       const compactionDefinition: Agent.Definition = {
         ...definition,
         instructions: `${definition.instructions}\n\n${compactionInstruction}`,
         tools: []
       }
-      const summary = yield* Effect.matchCauseEffect(
-        agent.run(
-          agentContext(snapshot.items, startingCommitId),
-          () => Effect.void,
-          compactionDefinition
-        ),
-        {
-          onFailure: (cause) => Effect.gen(function*() {
-            const reason = safeFailureReason(cause)
-            yield* store.appendFailureCommit(
-              sessionId,
-              reason,
-              startingCommitId,
-              requestedRunId,
-              requestedPeerId
-            )
-            return yield* new Session.PersistenceError({ message: reason })
-          }),
-          onSuccess: (response) => Effect.succeed(response)
-        }
-      )
-      return yield* store.appendCompactionCommit(
-        sessionId,
-        summary,
-        startingCommitId,
-        requestedRunId,
-        requestedPeerId,
-        startingCommitId
+      return yield* Effect.ensuring(
+        Effect.gen(function*() {
+          const summary = yield* Effect.matchCauseEffect(
+            agent.run(
+              agentContext(snapshot.items, startingCommitId),
+              () => Effect.void,
+              compactionDefinition
+            ),
+            {
+              onFailure: (cause) => Effect.gen(function*() {
+                const reason = safeFailureReason(cause)
+                yield* store.appendFailureCommit(
+                  sessionId,
+                  reason,
+                  startingCommitId,
+                  requestedRunId,
+                  requestedPeerId
+                )
+                rememberOperationKind(key, "compaction")
+                return yield* new Session.PersistenceError({ message: reason })
+              }),
+              onSuccess: (response) => Effect.succeed(response)
+            }
+          )
+          return yield* store.appendCompactionCommit(
+            sessionId,
+            summary,
+            startingCommitId,
+            requestedRunId,
+            requestedPeerId,
+            startingCommitId
+          ).pipe(Effect.tap(() => Effect.sync(() => {
+            rememberOperationKind(key, "compaction")
+          })))
+        }),
+        Effect.gen(function*() {
+          activeCompactions.delete(key)
+          yield* Deferred.succeed(completed, undefined)
+        })
       )
     }
   )
@@ -469,6 +606,81 @@ export const make = Effect.gen(function*() {
     return yield* Deferred.await(active.completed)
   })
 
+  const settle = Effect.fn("AgentRuntime.settle")(function*(sessionId: string) {
+    const existingState = settlementStates.get(sessionId)
+    if (existingState !== undefined && existingState.attempts > 0) {
+      return yield* new Session.PersistenceError({
+        message: `Settlement is already in progress for ${sessionId}`
+      })
+    }
+    const state = existingState ?? {
+      attempts: 0,
+      settled: false
+    }
+    state.attempts++
+    settlementStates.set(sessionId, state)
+    settlingSessions.add(sessionId)
+    return yield* Effect.gen(function*() {
+      const runs = [...activeRuns.values()].filter(
+        (active) => active.sessionId === sessionId
+      )
+      const compactions = [...activeCompactions.values()].filter(
+        (active) => active.sessionId === sessionId
+      )
+      for (const active of runs) {
+        yield* Deferred.succeed(active.request, { reason: "Session settled" })
+      }
+      for (const active of runs) {
+        yield* Deferred.await(active.completed)
+      }
+      for (const active of compactions) {
+        yield* Deferred.await(active.completed)
+      }
+
+      const operations = [...runs, ...compactions]
+      if (operations.length > 0) {
+        const snapshot = yield* store.history(sessionId)
+        for (const active of operations) {
+          const hasOutcome = snapshot.items.some((item) =>
+            (item.type === "AgentMessageCommit" ||
+              item.type === "CompactionCommit" ||
+              item.type === "FailureCommit" ||
+              item.type === "InterruptCommit") &&
+            item.inReplyTo === active.startingCommitId &&
+            item.runId === active.runId
+          )
+          if (!hasOutcome) {
+            return yield* new Session.PersistenceError({
+              message: `Agent Run did not record a terminal outcome for ${active.startingCommitId}`
+            })
+          }
+        }
+      }
+
+      const event = yield* store.settle(sessionId)
+      state.attempts--
+      state.settled = true
+      return event
+    }).pipe(
+      Effect.onExit((exit) => Exit.isFailure(exit)
+        ? Effect.sync(() => {
+          state.attempts--
+          if (state.attempts === 0 && !state.settled) {
+            settlementStates.delete(sessionId)
+            settlingSessions.delete(sessionId)
+          }
+        })
+        : Effect.void)
+    )
+  })
+
+  const reopen = Effect.fn("AgentRuntime.reopen")(function*(sessionId: string) {
+    const event = yield* store.reopen(sessionId)
+    settlementStates.delete(sessionId)
+    settlingSessions.delete(sessionId)
+    return event
+  })
+
   const react = Effect.fn("AgentRuntime.react")(function*(
     item: Session.HistoryItem
   ) {
@@ -500,7 +712,7 @@ export const make = Effect.gen(function*() {
     Effect.forkScoped
   )
 
-  return Service.of({ start, compact, interrupt })
+  return Service.of({ start, compact, interrupt, settle, reopen })
 })
 
 export const layerWithoutDependencies = Layer.effect(Service, make)
