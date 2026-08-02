@@ -93,7 +93,8 @@ export interface Interface {
     sessionId: string,
     content: string,
     commitId?: string,
-    peerId?: string
+    peerId?: string,
+    options?: Session.UserCommitOptions
   ) => Effect.Effect<
     Extract<Session.Commit, { readonly type: "UserCommit" }>,
     Session.Error
@@ -328,13 +329,15 @@ export const make = Effect.gen(function*() {
         sessionId: string,
         content: string,
         requestedId?: string,
-        peerId?: string
+        peerId?: string,
+        options?: Session.UserCommitOptions
       ) {
         return yield* store.appendUserCommit(
           sessionId,
           content,
           requestedId ?? (yield* randomId),
-          peerId
+          peerId,
+          options
         )
       }
     ),

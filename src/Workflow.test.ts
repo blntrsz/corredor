@@ -114,6 +114,195 @@ it.live(
 )
 
 it.live(
+  "runs Code Review through Integration and starts an explicit fixer Run",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-code-review-")
+    const contexts: Array<ReadonlyArray<Agent.ContextEntry>> = []
+    const definitions: Array<Agent.Definition> = []
+    const reviewer: Agent.Definition = {
+      id: "reviewer",
+      instructions: "Inspect the current repository and report actionable findings.",
+      tools: []
+    }
+    const fixer: Agent.Definition = {
+      id: "fixer",
+      instructions: "Address the integrated Code Review findings.",
+      tools: []
+    }
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (context, _onEvent, definition) => Effect.sync(() => {
+        contexts.push(context)
+        definitions.push(definition ?? Agent.defaultDefinition)
+        return definition?.id === "fixer"
+          ? "fixer completed the remediation"
+          : definition?.id === "reviewer"
+          ? context.some((entry) => entry.type === "AgentMessage")
+            ? "durable review summary"
+            : "review findings"
+          : "unexpected Agent"
+      })
+    }))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const workflow = yield* Workflow.Service
+      const workstream = yield* application.createWorkstream(
+        "code-review-workstream",
+        "Code Review Workstream"
+      )
+      const caller = yield* application.createSession(
+        "code-review-caller",
+        workstream.workstreamId
+      )
+      const starting = yield* application.createRootContext(
+        caller.sessionId,
+        "Current implementation context",
+        "code-review-starting"
+      )
+
+      const codeReview = yield* workflow.codeReview({
+        agent: reviewer,
+        sessionId: caller.sessionId,
+        startingCommitId: starting.commitId
+      }, {
+        reviewInstructions: "Review the current repository for correctness issues.",
+        remediationInstructions: "Fix every actionable finding from the Code Review.",
+        settlement: "integrate and settle",
+        reviewSessionId: "code-review-session",
+        reviewRunId: "code-review-run",
+        integrationRunId: "code-review-compaction",
+        remediationCommitId: "code-review-remediation",
+        fixerRunId: "code-review-fixer-run",
+        fixer
+      })
+
+      return {
+        caller,
+        starting,
+        codeReview,
+        reviewHistory: yield* application.history(codeReview.review.session.sessionId),
+        callerHistory: yield* application.history(caller.sessionId)
+      }
+    }).pipe(Effect.provide(workflowLayer(path, fakeAgent)))
+
+    expect(result.codeReview.review.session).toMatchObject({
+      type: "SessionCreated",
+      sessionId: "code-review-session",
+      workstreamId: "code-review-workstream",
+      origin: {
+        workstreamId: "code-review-workstream",
+        sessionId: result.caller.sessionId,
+        commitId: result.starting.commitId
+      }
+    })
+    expect(result.codeReview.review.root).toMatchObject({
+      type: "UserCommit",
+      parentId: null,
+      content: "Review the current repository for correctness issues.",
+      autoRun: false
+    })
+    expect(result.codeReview.review.outcome).toMatchObject({
+      type: "AgentMessageCommit",
+      content: "review findings",
+      inReplyTo: result.codeReview.review.root.commitId,
+      runId: "code-review-run"
+    })
+    expect(result.codeReview.integration.compaction).toMatchObject({
+      type: "CompactionCommit",
+      parentId: result.codeReview.review.outcome.commitId,
+      inReplyTo: result.codeReview.review.outcome.commitId,
+      content: "durable review summary",
+      runId: "code-review-compaction"
+    })
+    expect(result.codeReview.integration.picked).toMatchObject({
+      type: "AgentMessageCommit",
+      sessionId: result.caller.sessionId,
+      parentId: result.starting.commitId,
+      content: "durable review summary",
+      provenance: {
+        workstreamId: "code-review-workstream",
+        sessionId: "code-review-session",
+        commitId: result.codeReview.integration.compaction.commitId
+      }
+    })
+    expect(result.codeReview.integration.settlement).toMatchObject({
+      type: "SessionSettled",
+      sessionId: "code-review-session"
+    })
+    expect(result.codeReview.remediation).toMatchObject({
+      type: "UserCommit",
+      parentId: result.codeReview.integration.picked.commitId,
+      content: "Fix every actionable finding from the Code Review.",
+      autoRun: false
+    })
+    expect(result.codeReview.fixer).toMatchObject({
+      type: "AgentMessageCommit",
+      parentId: result.codeReview.remediation.commitId,
+      inReplyTo: result.codeReview.remediation.commitId,
+      content: "fixer completed the remediation",
+      runId: "code-review-fixer-run"
+    })
+    expect(result.reviewHistory.settled).toBe(true)
+    expect(result.callerHistory.branchHeadId).toBe(result.codeReview.fixer.commitId)
+    expect(result.callerHistory.items.map((item) => item.type)).toEqual([
+      "SessionCreated",
+      "UserCommit",
+      "AgentMessageCommit",
+      "UserCommit",
+      "AgentMessageCommit"
+    ])
+    expect(result.reviewHistory.items.map((item) => item.type)).toEqual([
+      "SessionCreated",
+      "UserCommit",
+      "AgentMessageCommit",
+      "CompactionCommit",
+      "SessionSettled"
+    ])
+    expect(definitions.map((definition) => definition.id)).toEqual([
+      "reviewer",
+      "reviewer",
+      "fixer"
+    ])
+    expect(contexts).toEqual([
+      [{
+        type: "User",
+        commitId: result.codeReview.review.root.commitId,
+        content: "Review the current repository for correctness issues."
+      }],
+      [
+        {
+          type: "User",
+          commitId: result.codeReview.review.root.commitId,
+          content: "Review the current repository for correctness issues."
+        },
+        {
+          type: "AgentMessage",
+          commitId: result.codeReview.review.outcome.commitId,
+          content: "review findings"
+        }
+      ],
+      [
+        {
+          type: "User",
+          commitId: result.starting.commitId,
+          content: "Current implementation context"
+        },
+        {
+          type: "AgentMessage",
+          commitId: result.codeReview.integration.picked.commitId,
+          content: "durable review summary"
+        },
+        {
+          type: "User",
+          commitId: result.codeReview.remediation.commitId,
+          content: "Fix every actionable finding from the Code Review."
+        }
+      ]
+    ])
+  })
+)
+
+it.live(
   "keeps completed child operations when later Workflow orchestration fails",
   () => Effect.gen(function*() {
     const { path } = yield* temporaryDatabase("corredor-workflow-failure-")
@@ -168,6 +357,120 @@ it.live(
         content: "completed before orchestration failed"
       })
     ])
+  })
+)
+
+it.live(
+  "leaves the review Session active when Code Review is not settled",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-code-review-active-")
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (_context, _onEvent, definition) => Effect.succeed(
+        definition?.id === "fixer" ? "fixed findings" : "review summary"
+      )
+    }))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const workflow = yield* Workflow.Service
+      const caller = yield* application.createSession("code-review-active-caller")
+      const starting = yield* application.createRootContext(
+        caller.sessionId,
+        "implementation",
+        "code-review-active-starting"
+      )
+      const codeReview = yield* workflow.codeReview({
+        agent: {
+          id: "reviewer",
+          instructions: "Review.",
+          tools: []
+        },
+        sessionId: caller.sessionId,
+        startingCommitId: starting.commitId
+      }, {
+        reviewInstructions: "Review the implementation.",
+        remediationInstructions: "Fix the findings.",
+        settlement: "integrate",
+        reviewSessionId: "code-review-active-session",
+        fixerRunId: "code-review-active-fixer-run",
+        fixer: {
+          id: "fixer",
+          instructions: "Fix.",
+          tools: []
+        }
+      })
+      return {
+        codeReview,
+        reviewHistory: yield* application.history("code-review-active-session")
+      }
+    }).pipe(Effect.provide(workflowLayer(path, fakeAgent)))
+
+    expect(result.codeReview.integration.settlement).toBeUndefined()
+    expect(result.reviewHistory.settled).toBe(false)
+    expect(result.reviewHistory.branchHeadId).toBe(
+      result.codeReview.integration.compaction.commitId
+    )
+  })
+)
+
+it.live(
+  "returns a durable fixer Failure Commit after Code Review progress is integrated",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-code-review-failure-")
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (_context, _onEvent, definition) => definition?.id === "fixer"
+        ? Effect.die(new Error("fixer crashed\nhidden detail"))
+        : Effect.succeed("review summary")
+    }))
+
+    const result = yield* Effect.gen(function*() {
+      const application = yield* Application.Service
+      const workflow = yield* Workflow.Service
+      const caller = yield* application.createSession("code-review-failure-caller")
+      const starting = yield* application.createRootContext(
+        caller.sessionId,
+        "implementation",
+        "code-review-failure-starting"
+      )
+      const codeReview = yield* workflow.codeReview({
+        agent: Agent.defaultDefinition,
+        sessionId: caller.sessionId,
+        startingCommitId: starting.commitId
+      }, {
+        reviewInstructions: "Review the implementation.",
+        remediationInstructions: "Fix the findings.",
+        settlement: "integrate and settle",
+        reviewSessionId: "code-review-failure-session",
+        fixerRunId: "code-review-failure-fixer-run",
+        fixer: {
+          id: "fixer",
+          instructions: "Fix.",
+          tools: []
+        }
+      })
+      return {
+        codeReview,
+        reviewHistory: yield* application.history("code-review-failure-session"),
+        callerHistory: yield* application.history(caller.sessionId)
+      }
+    }).pipe(Effect.provide(workflowLayer(path, fakeAgent)))
+
+    expect(result.codeReview.fixer).toMatchObject({
+      type: "FailureCommit",
+      inReplyTo: result.codeReview.remediation.commitId,
+      runId: "code-review-failure-fixer-run",
+      reason: "fixer crashed"
+    })
+    expect(result.reviewHistory.settled).toBe(true)
+    expect(result.reviewHistory.items).toContainEqual(expect.objectContaining({
+      type: "CompactionCommit"
+    }))
+    expect(result.callerHistory.items).toContainEqual(expect.objectContaining({
+      type: "UserCommit",
+      commitId: result.codeReview.remediation.commitId,
+      autoRun: false
+    }))
+    expect(result.callerHistory.branchHeadId).toBe(result.codeReview.fixer.commitId)
   })
 )
 
