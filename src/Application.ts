@@ -25,8 +25,19 @@ export interface Interface {
   readonly createSession: (
     sessionId?: string,
     workstreamId?: string,
-    peerId?: string
+    peerId?: string,
+    origin?: Session.SessionOrigin
   ) => Effect.Effect<Session.SessionCreated, Session.Error>
+  /** Adds explicit Workflow root context without triggering the ambient Agent reactor. */
+  readonly createRootContext: (
+    sessionId: string,
+    content: string,
+    commitId?: string,
+    peerId?: string
+  ) => Effect.Effect<
+    Extract<Session.Commit, { readonly type: "UserCommit" }>,
+    Session.Error
+  >
   readonly settle: (
     sessionId: string
   ) => Effect.Effect<Session.SessionSettled, Session.Error>
@@ -142,11 +153,33 @@ export const make = Effect.gen(function*() {
       return yield* store.workstream(workstreamId, view)
     }),
     createSession: Effect.fn("Application.createSession")(
-      function*(requestedId?: string, workstreamId?: string, peerId?: string) {
+      function*(
+        requestedId?: string,
+        workstreamId?: string,
+        peerId?: string,
+        origin?: Session.SessionOrigin
+      ) {
         return yield* store.createSession(
           requestedId ?? (yield* randomId),
           workstreamId,
-          peerId
+          peerId,
+          origin
+        )
+      }
+    ),
+    createRootContext: Effect.fn("Application.createRootContext")(
+      function*(
+        sessionId: string,
+        content: string,
+        requestedId?: string,
+        peerId?: string
+      ) {
+        return yield* store.appendUserCommit(
+          sessionId,
+          content,
+          requestedId ?? (yield* randomId),
+          peerId,
+          { autoRun: false }
         )
       }
     ),

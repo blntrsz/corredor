@@ -24,12 +24,15 @@ interface CommitMetadata {
   readonly createdAt: string
 }
 
-/** Identifies the Commit copied by a Cherry-pick operation. */
+/** Identifies a Commit in another Session that gives context its provenance. */
 export interface CommitProvenance {
   readonly workstreamId: string
   readonly sessionId: string
   readonly commitId: string
 }
+
+/** Provenance recorded when a Workflow creates a focused child Session. */
+export type SessionOrigin = CommitProvenance
 
 export type Commit =
   | CommitMetadata & {
@@ -39,6 +42,8 @@ export type Commit =
     readonly legacyMessageId?: string
     /** Receiver-local marker preventing synchronized input from auto-running. */
     readonly imported?: boolean
+    /** Workflow root context is explicitly started and must not auto-run. */
+    readonly autoRun?: boolean
   }
   | CommitMetadata & {
     readonly type: "ToolCommit"
@@ -101,6 +106,7 @@ export interface SessionCreated {
   readonly position: number
   readonly occurredAt: string
   readonly workstreamId?: string
+  readonly origin?: SessionOrigin
 }
 
 export interface SessionSettled {
@@ -218,7 +224,8 @@ const UserCommitSchema = Schema.Struct({
   content: Schema.String,
   peerId: Schema.optional(Schema.String),
   legacyMessageId: Schema.optional(Schema.String),
-  imported: Schema.optional(Schema.Boolean)
+  imported: Schema.optional(Schema.Boolean),
+  autoRun: Schema.optional(Schema.Boolean)
 })
 
 const ToolCommitSchema = Schema.Struct({
@@ -273,7 +280,8 @@ export const SessionCreatedSchema = Schema.Struct({
   type: Schema.Literal("SessionCreated"),
   activityId: Schema.String,
   occurredAt: Schema.String,
-  workstreamId: Schema.optional(Schema.String)
+  workstreamId: Schema.optional(Schema.String),
+  origin: Schema.optional(CommitProvenanceSchema)
 })
 
 export const SessionSettledSchema = Schema.Struct({
@@ -416,6 +424,11 @@ export type Error =
 
 export type SessionListView = "active" | "settled"
 
+export interface UserCommitOptions {
+  /** Prevents the server-owned Agent reactor from starting this root commit. */
+  readonly autoRun?: boolean
+}
+
 export interface SessionSummary {
   readonly sessionId: string
   readonly workstreamId: string
@@ -464,6 +477,7 @@ export interface SessionTransferMetadata {
   readonly createdEventId: string
   readonly settledAt: string | null
   readonly settledEventId: string | null
+  readonly origin?: SessionOrigin
 }
 
 /** The immutable context closure exchanged between two Peers. */
@@ -513,7 +527,8 @@ export const SessionTransferMetadataSchema = Schema.Struct({
   peerId: Schema.String,
   createdEventId: Schema.String,
   settledAt: Schema.NullOr(Schema.String),
-  settledEventId: Schema.NullOr(Schema.String)
+  settledEventId: Schema.NullOr(Schema.String),
+  origin: Schema.optional(CommitProvenanceSchema)
 })
 
 export const SyncBundleSchema = Schema.Struct({
@@ -673,7 +688,8 @@ export interface Interface {
   readonly createSession: (
     sessionId: string,
     workstreamId?: string,
-    peerId?: string
+    peerId?: string,
+    origin?: SessionOrigin
   ) => Effect.Effect<SessionCreated, Error>
   readonly settle: (
     sessionId: string
@@ -685,7 +701,8 @@ export interface Interface {
     sessionId: string,
     content: string,
     commitId: string,
-    peerId?: string
+    peerId?: string,
+    options?: UserCommitOptions
   ) => Effect.Effect<Extract<Commit, { readonly type: "UserCommit" }>, Error>
   readonly appendToolCommit: (
     sessionId: string,
@@ -833,6 +850,7 @@ const decodeHistory = (rows: ReadonlyArray<EventRow>): ReadonlyArray<HistoryItem
 
     if (row.event_type === "SessionCreated") {
       heads.set(row.session_id, currentHead)
+      const origin = decodeCommitProvenance(payload.origin)
       items.push({
         ...metadata,
         type: "SessionCreated",
@@ -840,7 +858,8 @@ const decodeHistory = (rows: ReadonlyArray<EventRow>): ReadonlyArray<HistoryItem
         occurredAt: row.occurred_at,
         ...(typeof payload.workstreamId === "string"
           ? { workstreamId: payload.workstreamId }
-          : {})
+          : {}),
+        ...(origin === undefined ? {} : { origin })
       })
       continue
     }
@@ -885,6 +904,7 @@ const decodeHistory = (rows: ReadonlyArray<EventRow>): ReadonlyArray<HistoryItem
         content: String(payload.content ?? ""),
         ...(typeof payload.peerId === "string" ? { peerId: payload.peerId } : {}),
         ...(payload.imported === true ? { imported: true } : {}),
+        ...(payload.autoRun === false ? { autoRun: false } : {}),
         ...(row.event_type === "UserMessageAdded" &&
           typeof payload.messageId === "string"
           ? { legacyMessageId: payload.messageId }
@@ -1040,6 +1060,7 @@ const syncRecordPayload = (
         content: record.content,
         parentId: record.parentId,
         ...(record.peerId === undefined ? {} : { peerId: record.peerId }),
+        ...(record.autoRun === undefined ? {} : { autoRun: record.autoRun }),
         ...(record.legacyMessageId === undefined
           ? {}
           : { messageId: record.legacyMessageId })
@@ -1542,6 +1563,9 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       ? null
       : rows.filter((row) => row.event_type === "SessionSettled").at(-1)?.event_id ?? null
 
+    const created = history.find(
+      (item): item is SessionCreated => item.type === "SessionCreated"
+    )
     return {
       version: 1 as const,
       sourcePeerId: requestedPeerId,
@@ -1549,7 +1573,8 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       session: {
         ...session,
         createdEventId,
-        settledEventId
+        settledEventId,
+        ...(created?.origin === undefined ? {} : { origin: created.origin })
       },
       branchHeadId,
       records
@@ -1836,6 +1861,16 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
           message: `Session ${bundle.session.sessionId} has a conflicting creation activity`
         })
       }
+      const existingOrigin = decodeHistory(sessionRowsBefore).find(
+        (item): item is SessionCreated => item.type === "SessionCreated"
+      )?.origin
+      if (!isDeepStrictEqual(existingOrigin, bundle.session.origin)) {
+        return yield* new SyncConflict({
+          sessionId: bundle.session.sessionId,
+          recordId: bundle.session.createdEventId,
+          message: `Session ${bundle.session.sessionId} has conflicting origin provenance`
+        })
+      }
 
       const existingSettlementEventId = sessionRowsBefore.filter(
         (row) => row.event_type === "SessionSettled"
@@ -1900,7 +1935,12 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         bundle.session.sessionId,
         bundle.session.createdEventId,
         "SessionCreated",
-        { workstreamId: bundle.session.workstreamId },
+        {
+          workstreamId: bundle.session.workstreamId,
+          ...(bundle.session.origin === undefined
+            ? {}
+            : { origin: bundle.session.origin })
+        },
         1,
         bundle.session.createdAt
       )
@@ -2198,7 +2238,8 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     createSession: Effect.fn("Session.createSession")(function*(
       sessionId,
       requestedWorkstreamId = defaultWorkstreamId,
-      requestedPeerId = defaultPeerId
+      requestedPeerId = defaultPeerId,
+      origin?: SessionOrigin
     ) {
       const result = yield* Effect.gen(function*() {
         const rows = yield* sessionRows(sessionId)
@@ -2228,7 +2269,10 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
           sessionId,
           yield* randomId,
           "SessionCreated",
-          { workstreamId: requestedWorkstreamId },
+          {
+            workstreamId: requestedWorkstreamId,
+            ...(origin === undefined ? {} : { origin })
+          },
           1
         )
         yield* sql`INSERT INTO peer_branch_heads (peer_id, session_id, commit_id)
@@ -2260,7 +2304,13 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       return yield* Effect.die(`Unexpected lifecycle result: ${result.type}`)
     }),
     appendUserCommit: Effect.fn("Session.appendUserCommit")(
-      function*(sessionId, content, commitId, requestedPeerId = defaultPeerId) {
+      function*(
+        sessionId,
+        content,
+        commitId,
+        requestedPeerId = defaultPeerId,
+        options?: UserCommitOptions
+      ) {
         const result = yield* Effect.gen(function*() {
           const rows = yield* sessionRows(sessionId)
           if (rows.length === 0) return { type: "NotFound" as const }
@@ -2277,7 +2327,14 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
             sessionId,
             commitId,
             "UserCommit",
-            { content, parentId, peerId: requestedPeerId },
+            {
+              content,
+              parentId,
+              peerId: requestedPeerId,
+              ...(options?.autoRun === undefined
+                ? {}
+                : { autoRun: options.autoRun })
+            },
             rows.at(-1)!.sequence + 1
           )
           yield* updateHeadIfCurrent(sessionId, requestedPeerId, parentId, commitId)
