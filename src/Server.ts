@@ -67,6 +67,13 @@ const syncConflict = (error: Session.SyncConflict) => Effect.succeed(
   )
 )
 
+const invalidIntegration = (error: Application.InvalidIntegration) => Effect.succeed(
+  HttpServerResponse.jsonUnsafe(
+    { error: error.message },
+    { status: 409 }
+  )
+)
+
 const health = Session.Service.pipe(
   Effect.flatMap((store) => store.check),
   Effect.match({
@@ -357,6 +364,40 @@ const cherryPick = Effect.gen(function*() {
   Effect.catchCause(() => Effect.succeed(internalServerError()))
 )
 
+const integrate = Effect.gen(function*() {
+  const application = yield* Application.Service
+  const params = yield* HttpRouter.params
+  const request = yield* HttpServerRequest.HttpServerRequest
+  const targetSessionId = params.sessionId
+  if (targetSessionId === undefined) return missingSessionId()
+  const body = yield* Schema.decodeUnknownEffect(Schema.Struct({
+    sourceSessionId: Schema.String,
+    sourceBranchHeadId: Schema.String,
+    targetBranchHeadId: Schema.NullOr(Schema.String),
+    settlement: Schema.Literals(Application.integrationChoices),
+    agent: Schema.optional(Agent.DefinitionSchema),
+    runId: Schema.optional(Schema.String)
+  }))(yield* request.json)
+  const integration = yield* application.integrate({
+    ...body,
+    targetSessionId,
+    peerId: peerIdFrom(request)
+  })
+  return HttpServerResponse.jsonUnsafe({ integration }, { status: 201 })
+}).pipe(
+  Effect.catchTag("@corredor/Session/NotFound", sessionNotFound),
+  Effect.catchTag("@corredor/Session/Settled", sessionSettled),
+  Effect.catchTag("@corredor/Session/AlreadySettled", (error) => Effect.succeed(
+    HttpServerResponse.jsonUnsafe(
+      { error: `Session already settled: ${error.sessionId}` },
+      { status: 409 }
+    )
+  )),
+  Effect.catchTag("@corredor/Session/CommitNotFound", commitNotFound),
+  Effect.catchTag("@corredor/Application/InvalidIntegration", invalidIntegration),
+  Effect.catchCause(() => Effect.succeed(internalServerError()))
+)
+
 const interruptAgentRun = Effect.gen(function*() {
   const application = yield* Application.Service
   const params = yield* HttpRouter.params
@@ -563,6 +604,11 @@ const routes = Layer.mergeAll(
     "POST",
     "/v1/sessions/:sessionId/cherry-pick",
     cherryPick
+  ),
+  HttpRouter.add(
+    "POST",
+    "/v1/sessions/:sessionId/integrate",
+    integrate
   ),
   HttpRouter.add(
     "POST",

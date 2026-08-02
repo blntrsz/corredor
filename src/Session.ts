@@ -384,6 +384,15 @@ export class ToolCommitConflict extends Schema.TaggedErrorClass<ToolCommitConfli
     index: Schema.Number
   }
 ) {}
+export class BranchHeadConflict extends Schema.TaggedErrorClass<BranchHeadConflict>()(
+  "@corredor/Session/BranchHeadConflict",
+  {
+    sessionId: Schema.String,
+    expectedHeadId: Schema.NullOr(Schema.String),
+    actualHeadId: Schema.NullOr(Schema.String),
+    message: Schema.String
+  }
+) {}
 export class Settled extends Schema.TaggedErrorClass<Settled>()(
   "@corredor/Session/Settled",
   { sessionId: Schema.String }
@@ -416,6 +425,7 @@ export type Error =
   | NotFound
   | CommitNotFound
   | ToolCommitConflict
+  | BranchHeadConflict
   | Settled
   | AlreadySettled
   | NotSettled
@@ -727,7 +737,8 @@ export interface Interface {
     content: string,
     inReplyTo: string,
     runId?: string,
-    peerId?: string
+    peerId?: string,
+    expectedHeadId?: string | null
   ) => Effect.Effect<Extract<Commit, { readonly type: "CompactionCommit" }>, Error>
   readonly appendFailureCommit: (
     sessionId: string,
@@ -758,7 +769,8 @@ export interface Interface {
     sourceSessionId: string,
     sourceCommitId: string,
     targetSessionId: string,
-    targetPeerId?: string
+    targetPeerId?: string,
+    expectedTargetHeadId?: string | null
   ) => Effect.Effect<Extract<Commit, { readonly type: "AgentMessageCommit" }>, Error>
   readonly checkout: (
     sessionId: string,
@@ -1470,10 +1482,11 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     content: string,
     inReplyTo: string,
     runId: string | undefined,
-    peerId: string
+    peerId: string,
+    expectedHeadId?: string | null
   ): Effect.Effect<
     Extract<Commit, { readonly type: "CompactionCommit" }>,
-    PersistenceError
+    PersistenceError | Error
   > => Effect.gen(function*() {
     const rows = yield* sessionRows(sessionId)
     if (rows.length === 0) return yield* new NotFound({ sessionId })
@@ -1482,6 +1495,22 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       return yield* new Settled({ sessionId })
     }
     const history = decodeHistory(rows)
+    yield* ensurePeerHead(sessionId, peerId)
+    if (expectedHeadId !== undefined) {
+      const heads = yield* sql<{ readonly commitId: string | null }>`
+        SELECT commit_id AS commitId
+        FROM peer_branch_heads
+        WHERE peer_id=${peerId} AND session_id=${sessionId}`
+      const actualHeadId = heads[0]?.commitId ?? null
+      if (actualHeadId !== expectedHeadId) {
+        return yield* new BranchHeadConflict({
+          sessionId,
+          expectedHeadId,
+          actualHeadId,
+          message: "Source Branch Head changed during Compaction"
+        })
+      }
+    }
     const existing = history.find(
       (item): item is Extract<Commit, { readonly type: "CompactionCommit" }> =>
         item.type === "CompactionCommit" &&
@@ -1494,7 +1523,6 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     )) {
       return yield* new CommitNotFound({ sessionId, commitId: inReplyTo })
     }
-    yield* ensurePeerHead(sessionId, peerId)
     const commitId = yield* randomId
     const item = yield* insert(
       sessionId,
@@ -1505,7 +1533,7 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     )
     yield* updateHeadIfCurrent(sessionId, peerId, inReplyTo, commitId)
     return item as Extract<Commit, { readonly type: "CompactionCommit" }>
-  }).pipe(sql.withTransaction, persist)
+  }).pipe(sql.withTransaction, preserveSessionError)
 
   const exportBranch = (
     sessionId: string,
@@ -2048,7 +2076,8 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     sourceSessionId: string,
     sourceCommitId: string,
     targetSessionId: string,
-    requestedPeerId: string
+    requestedPeerId: string,
+    expectedTargetHeadId?: string | null
   ): Effect.Effect<
     | { readonly type: "NotFound"; readonly sessionId: string }
     | { readonly type: "Settled"; readonly sessionId: string }
@@ -2056,6 +2085,12 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       readonly type: "CommitNotFound"
       readonly sessionId: string
       readonly commitId: string
+    }
+    | {
+      readonly type: "BranchHeadConflict"
+      readonly sessionId: string
+      readonly expectedHeadId: string | null
+      readonly actualHeadId: string | null
     }
     | {
       readonly type: "Appended"
@@ -2111,6 +2146,14 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       WHERE peer_id=${requestedPeerId} AND session_id=${targetSessionId}
     `
     const parentId = heads[0]?.commitId ?? null
+    if (expectedTargetHeadId !== undefined && parentId !== expectedTargetHeadId) {
+      return {
+        type: "BranchHeadConflict" as const,
+        sessionId: targetSessionId,
+        expectedHeadId: expectedTargetHeadId,
+        actualHeadId: parentId
+      }
+    }
     const commitId = yield* randomId
     const item = yield* insert(
       targetSessionId,
@@ -2459,14 +2502,16 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         content,
         inReplyTo,
         runId,
-        requestedPeerId = defaultPeerId
+        requestedPeerId = defaultPeerId,
+        expectedHeadId?: string | null
       ) {
         return yield* appendCompactionCommit(
           sessionId,
           content,
           inReplyTo,
           runId,
-          requestedPeerId
+          requestedPeerId,
+          expectedHeadId
         )
       }
     ),
@@ -2556,13 +2601,15 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       sourceSessionId,
       sourceCommitId,
       targetSessionId,
-      requestedPeerId = defaultPeerId
+      requestedPeerId = defaultPeerId,
+      expectedTargetHeadId?: string | null
     ) {
       const result = yield* cherryPick(
         sourceSessionId,
         sourceCommitId,
         targetSessionId,
-        requestedPeerId
+        requestedPeerId,
+        expectedTargetHeadId
       )
       if (result.type === "NotFound") {
         return yield* new NotFound({ sessionId: result.sessionId })
@@ -2574,6 +2621,14 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         return yield* new CommitNotFound({
           sessionId: result.sessionId,
           commitId: result.commitId
+        })
+      }
+      if (result.type === "BranchHeadConflict") {
+        return yield* new BranchHeadConflict({
+          sessionId: result.sessionId,
+          expectedHeadId: result.expectedHeadId,
+          actualHeadId: result.actualHeadId,
+          message: "Target Branch Head changed during Cherry-pick"
         })
       }
       return result.item

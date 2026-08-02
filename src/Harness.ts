@@ -18,6 +18,7 @@ import {
 } from "@earendil-works/pi-tui"
 import { Crypto, Effect, Stream } from "effect"
 import * as AgentProxy from "./AgentProxy.ts"
+import * as Application from "./Application.ts"
 import * as Session from "./Session.ts"
 import type {
   HistoryItem,
@@ -212,6 +213,54 @@ class WorkstreamPicker implements Component, Focusable {
       ))
     }
     lines.push("", dim("  ↑↓ navigate · enter open · type search · esc cancel"), "")
+    return lines.map((line) => truncateToWidth(line, width))
+  }
+
+  invalidate(): void {}
+}
+
+class IntegrationChoicePicker implements Component, Focusable {
+  focused = false
+  private selected = 0
+
+  constructor(
+    private readonly onSelect: (choice: Application.IntegrationChoice) => void,
+    private readonly onCancel: () => void,
+    private readonly requestRender: () => void
+  ) {}
+
+  handleInput(data: string): void {
+    if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+      return this.onCancel()
+    }
+    if (matchesKey(data, Key.up)) {
+      this.selected = Math.max(0, this.selected - 1)
+    } else if (matchesKey(data, Key.down)) {
+      this.selected = Math.min(Application.integrationChoices.length - 1, this.selected + 1)
+    } else if (matchesKey(data, Key.enter)) {
+      const choice = Application.integrationChoices[this.selected]
+      if (choice !== undefined) this.onSelect(choice)
+      return
+    }
+    this.requestRender()
+  }
+
+  render(width: number): string[] {
+    const lines = [
+      "",
+      bold(cyan("  Integrate Session")),
+      dim("  Choose how to finish the source Session."),
+      ""
+    ]
+    for (const [index, choice] of Application.integrationChoices.entries()) {
+      const selected = index === this.selected
+      const prefix = selected ? cyan("› ") : "  "
+      lines.push(truncateToWidth(
+        `  ${prefix}${selected ? bold(choice) : choice}`,
+        width
+      ))
+    }
+    lines.push("", dim("  ↑↓ navigate · enter choose · esc cancel"), "")
     return lines.map((line) => truncateToWidth(line, width))
   }
 
@@ -444,6 +493,7 @@ const make = (
     { name: "resume-settled", description: "Inspect a settled Session" },
     { name: "history", description: "Check out an earlier Commit" },
     { name: "compact", description: "Compact the current Branch" },
+    { name: "integrate", description: "Integrate another Session" },
     { name: "settle", description: "Settle the current Session" },
     { name: "reopen", description: "Reopen the current Session" },
     { name: "interrupt", description: "Interrupt the active Agent Run" },
@@ -800,6 +850,116 @@ const make = (
     })
   }
 
+  const chooseIntegration = (
+    sourceSessionId: string,
+    sourceHistory: Session.HistorySnapshot
+  ) => {
+    const sourceBranchHeadId = sourceHistory.branchHeadId
+    if (sourceBranchHeadId === null) {
+      showConversation()
+      addErrorMessage("The source Session has no Branch Head to integrate.")
+      return
+    }
+    const targetSessionId = sessionId
+    const choicePicker = new IntegrationChoicePicker(
+      (settlement) => {
+        app.clear()
+        app.addChild(new Loader(tui, cyan, dim, "Integrating…"))
+        tui.requestRender()
+        void Effect.runPromise(proxy.history(targetSessionId)).then((targetHistory) => {
+          if (targetHistory.branchHeadId !== branchHeadId) {
+            throw new Error("The target Branch Head changed; choose Integration again.")
+          }
+          return Effect.runPromise(proxy.integrate({
+            sourceSessionId,
+            sourceBranchHeadId,
+            targetSessionId,
+            targetBranchHeadId: targetHistory.branchHeadId,
+            settlement
+          }))
+        }).then((integration) => {
+          if (stopped || sessionId !== targetSessionId) return
+          branchHeadId = integration.picked.commitId
+          lifecycleNotice = settlement === "integrate and settle"
+            ? "Source Session integrated and settled."
+            : "Source Session integrated."
+          renderActivity(integration.picked)
+          showConversation()
+        }).catch((error: unknown) => {
+          if (stopped) return
+          showConversation()
+          addErrorMessage(formatError(error))
+        })
+      },
+      showConversation,
+      () => tui.requestRender()
+    )
+    app.clear()
+    app.addChild(choicePicker)
+    tui.setFocus(choicePicker)
+    tui.requestRender()
+  }
+
+  const integrateAnotherSession = () => {
+    if (settled) {
+      addErrorMessage("Session is settled; use /reopen before integrating.")
+      return
+    }
+    void Effect.runPromise(proxy.listWorkstreams()).then((workstreams) => {
+      if (workstreams.length === 0) {
+        showConversation()
+        addErrorMessage("No Workstreams found.")
+        return
+      }
+      const loadSources = (workstreamId: string) => {
+        void Effect.runPromise(proxy.workstream(workstreamId, "active")).then((snapshot) => {
+          const sources = snapshot.sessions.filter(
+            (candidate) => candidate.sessionId !== sessionId
+          )
+          if (sources.length === 0) {
+            showConversation()
+            addErrorMessage("No other active Sessions found in this Workstream.")
+            return
+          }
+          const picker = new SessionPicker(
+            sources,
+            (sourceSessionId) => {
+              void Effect.runPromise(proxy.history(sourceSessionId)).then(
+                (sourceHistory) => chooseIntegration(sourceSessionId, sourceHistory)
+              ).catch((error: unknown) => {
+                showConversation()
+                addErrorMessage(formatError(error))
+              })
+            },
+            showConversation,
+            () => tui.requestRender(),
+            "Integrate Source Session"
+          )
+          app.clear()
+          app.addChild(picker)
+          tui.setFocus(picker)
+          tui.requestRender()
+        }).catch((error: unknown) => {
+          showConversation()
+          addErrorMessage(formatError(error))
+        })
+      }
+      const picker = new WorkstreamPicker(
+        workstreams,
+        loadSources,
+        showConversation,
+        () => tui.requestRender()
+      )
+      app.clear()
+      app.addChild(picker)
+      tui.setFocus(picker)
+      tui.requestRender()
+    }).catch((error: unknown) => {
+      addErrorMessage(formatError(error))
+      tui.requestRender()
+    })
+  }
+
   const settleCurrentSession = () => {
     void Effect.runPromise(proxy.settle(sessionId)).then((event) => {
       if (stopped) return
@@ -853,6 +1013,7 @@ const make = (
     if (prompt === "/resume-settled") return resumeSession("settled")
     if (prompt === "/history" || prompt === "/tree") return openTree()
     if (prompt === "/compact") return compactCurrentBranch()
+    if (prompt === "/integrate") return integrateAnotherSession()
     if (prompt === "/settle") return settleCurrentSession()
     if (prompt === "/reopen") return reopenCurrentSession()
     if (prompt === "/interrupt") return interruptCurrentRun()

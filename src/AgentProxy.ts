@@ -7,6 +7,7 @@ import {
 } from "effect/unstable/http"
 import { Agent } from "./Agent.ts"
 import * as Session from "./Session.ts"
+import type * as Application from "./Application.ts"
 
 export class ProxyError extends Schema.TaggedErrorClass<ProxyError>()(
   "@corredor/AgentProxy/ProxyError",
@@ -73,6 +74,9 @@ export interface Interface {
     Extract<Session.Commit, { readonly type: "AgentMessageCommit" }>,
     ProxyError
   >
+  readonly integrate: (
+    input: Omit<Application.IntegrationInput, "peerId">
+  ) => Effect.Effect<Application.IntegrationResult, ProxyError>
   readonly interruptAgentRun: (
     sessionId: string,
     startingCommitId: string,
@@ -152,6 +156,17 @@ const SyncBundleResponse = Schema.Struct({
 })
 const SyncResultResponse = Schema.Struct({
   result: Session.SyncResultSchema
+})
+const IntegrationResponse = Schema.Struct({
+  integration: Schema.Struct({
+    sourceSessionId: Schema.String,
+    sourceBranchHeadId: Schema.String,
+    targetSessionId: Schema.String,
+    targetBranchHeadId: Schema.NullOr(Schema.String),
+    compaction: Session.CommitSchema,
+    picked: Session.CommitSchema,
+    settlement: Schema.optional(Session.SessionSettledSchema)
+  })
 })
 
 const proxyError = (cause: unknown): ProxyError => new ProxyError({
@@ -421,6 +436,28 @@ export const make = (
         })
       }
       return decoded.commit
+    }),
+    integrate: Effect.fn("AgentProxy.integrate")(function*(
+      input: Omit<Application.IntegrationInput, "peerId">
+    ) {
+      const body = yield* responseJson(withPeer(HttpClientRequest.post(
+        url(`/v1/sessions/${encodeURIComponent(input.targetSessionId)}/integrate`)
+      ).pipe(HttpClientRequest.bodyJsonUnsafe(input))))
+      const decoded = yield* Schema.decodeUnknownEffect(IntegrationResponse)(body)
+        .pipe(Effect.mapError(proxyError))
+      if (
+        decoded.integration.compaction.type !== "CompactionCommit" ||
+        decoded.integration.picked.type !== "AgentMessageCommit"
+      ) {
+        return yield* new ProxyError({
+          message: "Integration API returned invalid Commit types"
+        })
+      }
+      return {
+        ...decoded.integration,
+        compaction: decoded.integration.compaction,
+        picked: decoded.integration.picked
+      } as Application.IntegrationResult
     }),
     interruptAgentRun: Effect.fn("AgentProxy.interruptAgentRun")(
       function*(
