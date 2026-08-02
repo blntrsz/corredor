@@ -1590,6 +1590,22 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         message: "A settled Session must include its stable Settlement activity ID"
       })
     }
+    if (
+      bundle.session.settledAt === null &&
+      bundle.session.settledEventId !== null
+    ) {
+      return yield* new SyncValidationError({
+        message: "An active Session must not include a Settlement activity ID"
+      })
+    }
+    if (
+      bundle.session.settledEventId !== null &&
+      bundle.session.createdEventId === bundle.session.settledEventId
+    ) {
+      return yield* new SyncValidationError({
+        message: "Session lifecycle activities must have distinct stable IDs"
+      })
+    }
 
     const incomingIds = new Set<string>()
     for (const record of bundle.records) {
@@ -1735,6 +1751,49 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
       })
     }
 
+    const incomingRecords = new Map(
+      bundle.records.map((record) => [branchRecordId(record), record] as const)
+    )
+    const targetRecords = new Map(
+      targetHistoryBefore
+        .filter(isBranchRecord)
+        .map((record) => [branchRecordId(record), record] as const)
+    )
+    const reachable = new Set<string>()
+    if (bundle.branchHeadId === null) {
+      if (bundle.records.length > 0) {
+        return yield* new SyncValidationError({
+          message: "A Branch without a selected Head must not contain records"
+        })
+      }
+    } else {
+      let currentId: string | null = bundle.branchHeadId
+      while (currentId !== null) {
+        if (reachable.has(currentId)) {
+          return yield* new SyncValidationError({
+            message: `Synchronization ancestry repeats record ${currentId}`
+          })
+        }
+        reachable.add(currentId)
+        const parentRecord: BranchRecord | undefined =
+          incomingRecords.get(currentId) ?? targetRecords.get(currentId)
+        if (parentRecord === undefined) {
+          return yield* new SyncValidationError({
+            message: `Selected Branch Head ${bundle.branchHeadId} has a missing ancestor ${currentId}`
+          })
+        }
+        currentId = parentRecord.parentId
+      }
+      const unreachable = bundle.records.find(
+        (record) => !reachable.has(branchRecordId(record))
+      )
+      if (unreachable !== undefined) {
+        return yield* new SyncValidationError({
+          message: `Record ${branchRecordId(unreachable)} is outside the selected Branch ancestry`
+        })
+      }
+    }
+
     const preexistingWorkstream = (yield* workstreamMetadata(
       bundle.workstream.workstreamId
     ))[0]
@@ -1765,6 +1824,49 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         recordId: bundle.session.sessionId,
         message: `Session ${bundle.session.sessionId} has conflicting metadata`
       })
+    }
+    if (preexistingSession !== undefined) {
+      const existingCreatedEventId = sessionRowsBefore.find(
+        (row) => row.event_type === "SessionCreated"
+      )?.event_id
+      if (existingCreatedEventId !== bundle.session.createdEventId) {
+        return yield* new SyncConflict({
+          sessionId: bundle.session.sessionId,
+          recordId: bundle.session.createdEventId,
+          message: `Session ${bundle.session.sessionId} has a conflicting creation activity`
+        })
+      }
+
+      const existingSettlementEventId = sessionRowsBefore.filter(
+        (row) => row.event_type === "SessionSettled"
+      ).at(-1)?.event_id ?? null
+      if (
+        preexistingSession.settledAt !== null &&
+        bundle.session.settledAt !== null &&
+        (
+          preexistingSession.settledAt !== bundle.session.settledAt ||
+          existingSettlementEventId !== bundle.session.settledEventId
+        )
+      ) {
+        return yield* new SyncConflict({
+          sessionId: bundle.session.sessionId,
+          recordId: bundle.session.settledEventId!,
+          message: `Session ${bundle.session.sessionId} has a conflicting Settlement activity`
+        })
+      }
+      if (
+        preexistingSession.settledAt === null &&
+        bundle.session.settledAt !== null &&
+        sessionRowsBefore.some(
+          (row) => row.event_id === bundle.session.settledEventId
+        )
+      ) {
+        return yield* new SyncConflict({
+          sessionId: bundle.session.sessionId,
+          recordId: bundle.session.settledEventId!,
+          message: `Settlement activity ${bundle.session.settledEventId} already belongs to this Session history`
+        })
+      }
     }
 
     const workstreamRows = yield* workstreamMetadata(bundle.workstream.workstreamId)
