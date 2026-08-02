@@ -165,7 +165,15 @@ it("does not replay legacy projected User Commits", () => {
     parentId: "legacy-user",
     content: "new request"
   })
+  const synchronized = commit(3, {
+    type: "UserCommit",
+    commitId: "synchronized-user",
+    parentId: null,
+    content: "remote request",
+    imported: true
+  })
 
   expect(AgentRuntime.isRunnableUserCommit(legacy)).toBe(false)
   expect(AgentRuntime.isRunnableUserCommit(canonical)).toBe(true)
+  expect(AgentRuntime.isRunnableUserCommit(synchronized)).toBe(false)
 })

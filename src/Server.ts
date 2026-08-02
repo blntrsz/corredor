@@ -53,6 +53,20 @@ const commitNotFound = (error: Session.CommitNotFound) => Effect.succeed(
   )
 )
 
+const syncValidation = (error: Session.SyncValidationError) => Effect.succeed(
+  HttpServerResponse.jsonUnsafe(
+    { error: error.message },
+    { status: 400 }
+  )
+)
+
+const syncConflict = (error: Session.SyncConflict) => Effect.succeed(
+  HttpServerResponse.jsonUnsafe(
+    { error: error.message, recordId: error.recordId },
+    { status: 409 }
+  )
+)
+
 const health = Session.Service.pipe(
   Effect.flatMap((store) => store.check),
   Effect.match({
@@ -199,6 +213,50 @@ const sessionHistory = Effect.gen(function*() {
     history: yield* application.history(sessionId, peerIdFrom(request))
   })
 }).pipe(Effect.orDie)
+
+const exportBranch = Effect.gen(function*() {
+  const application = yield* Application.Service
+  const params = yield* HttpRouter.params
+  const request = yield* HttpServerRequest.HttpServerRequest
+  const sessionId = params.sessionId
+  if (sessionId === undefined) return missingSessionId()
+  const rawHeadId = new URL(request.originalUrl).searchParams.get("headId")
+  const headId = rawHeadId === null
+    ? undefined
+    : rawHeadId.length === 0
+    ? null
+    : rawHeadId
+  const bundle = yield* application.exportBranch(
+    sessionId,
+    headId,
+    peerIdFrom(request)
+  )
+  return HttpServerResponse.jsonUnsafe({ bundle })
+}).pipe(
+  Effect.catchTag("@corredor/Session/NotFound", sessionNotFound),
+  Effect.catchTag("@corredor/Session/CommitNotFound", commitNotFound),
+  Effect.catchTag("@corredor/Session/SyncValidationError", syncValidation),
+  Effect.catchCause(() => Effect.succeed(internalServerError()))
+)
+
+const importBranch = Effect.gen(function*() {
+  const application = yield* Application.Service
+  const request = yield* HttpServerRequest.HttpServerRequest
+  const bundle = yield* Schema.decodeUnknownEffect(Session.SyncBundleSchema)(
+    yield* request.json
+  ).pipe(Effect.mapError(() => new Session.SyncValidationError({
+    message: "Invalid synchronization payload"
+  })))
+  const result = yield* application.importBranch(
+    bundle as Session.SyncBundle,
+    peerIdFrom(request)
+  )
+  return HttpServerResponse.jsonUnsafe({ result })
+}).pipe(
+  Effect.catchTag("@corredor/Session/SyncValidationError", syncValidation),
+  Effect.catchTag("@corredor/Session/SyncConflict", syncConflict),
+  Effect.catchCause(() => Effect.succeed(internalServerError()))
+)
 
 const startAgentRun = Effect.gen(function*() {
   const application = yield* Application.Service
@@ -485,6 +543,12 @@ const routes = Layer.mergeAll(
     "/v1/sessions/:sessionId/history",
     sessionHistory
   ),
+  HttpRouter.add(
+    "GET",
+    "/v1/sync/export/:sessionId",
+    exportBranch
+  ),
+  HttpRouter.add("POST", "/v1/sync/import", importBranch),
   HttpRouter.add(
     "POST",
     "/v1/sessions/:sessionId/runs",

@@ -37,6 +37,8 @@ export type Commit =
     readonly content: string
     readonly peerId?: string
     readonly legacyMessageId?: string
+    /** Receiver-local marker preventing synchronized input from auto-running. */
+    readonly imported?: boolean
   }
   | CommitMetadata & {
     readonly type: "ToolCommit"
@@ -215,7 +217,8 @@ const UserCommitSchema = Schema.Struct({
   type: Schema.Literal("UserCommit"),
   content: Schema.String,
   peerId: Schema.optional(Schema.String),
-  legacyMessageId: Schema.optional(Schema.String)
+  legacyMessageId: Schema.optional(Schema.String),
+  imported: Schema.optional(Schema.Boolean)
 })
 
 const ToolCommitSchema = Schema.Struct({
@@ -287,6 +290,19 @@ export const SessionReopenedSchema = Schema.Struct({
   occurredAt: Schema.String
 })
 
+export const LegacyToolCallSchema = Schema.Struct({
+  ...historyMetadata,
+  type: Schema.Literal("LegacyToolCall"),
+  legacyId: Schema.String,
+  parentId: Schema.NullOr(Schema.String),
+  createdAt: Schema.String,
+  toolCallId: Schema.String,
+  name: Schema.String,
+  input: Schema.Unknown,
+  inReplyTo: Schema.String,
+  index: Schema.Number
+})
+
 /** Runtime decoder shared by the HTTP client and SSE transport. */
 export const HistoryItemSchema = Schema.Union([
   UserCommitSchema,
@@ -295,18 +311,7 @@ export const HistoryItemSchema = Schema.Union([
   CompactionCommitSchema,
   FailureCommitSchema,
   InterruptCommitSchema,
-  Schema.Struct({
-    ...historyMetadata,
-    type: Schema.Literal("LegacyToolCall"),
-    legacyId: Schema.String,
-    parentId: Schema.NullOr(Schema.String),
-    createdAt: Schema.String,
-    toolCallId: Schema.String,
-    name: Schema.String,
-    input: Schema.Unknown,
-    inReplyTo: Schema.String,
-    index: Schema.Number
-  }),
+  LegacyToolCallSchema,
   SessionCreatedSchema,
   SessionSettledSchema,
   SessionReopenedSchema,
@@ -326,6 +331,11 @@ export const CommitSchema = Schema.Union([
   CompactionCommitSchema,
   FailureCommitSchema,
   InterruptCommitSchema
+])
+
+export const BranchRecordSchema = Schema.Union([
+  CommitSchema,
+  LegacyToolCallSchema
 ])
 
 export const HistorySnapshotSchema = Schema.Struct({
@@ -378,6 +388,18 @@ export class NotSettled extends Schema.TaggedErrorClass<NotSettled>()(
   "@corredor/Session/NotSettled",
   { sessionId: Schema.String }
 ) {}
+export class SyncValidationError extends Schema.TaggedErrorClass<SyncValidationError>()(
+  "@corredor/Session/SyncValidationError",
+  { message: Schema.String }
+) {}
+export class SyncConflict extends Schema.TaggedErrorClass<SyncConflict>()(
+  "@corredor/Session/SyncConflict",
+  {
+    sessionId: Schema.String,
+    recordId: Schema.String,
+    message: Schema.String
+  }
+) {}
 export type Error =
   | PersistenceError
   | AlreadyExists
@@ -389,6 +411,8 @@ export type Error =
   | Settled
   | AlreadySettled
   | NotSettled
+  | SyncValidationError
+  | SyncConflict
 
 export type SessionListView = "active" | "settled"
 
@@ -429,6 +453,39 @@ export interface WorkstreamSnapshot {
   readonly sessions: ReadonlyArray<SessionSummary>
 }
 
+/** Session metadata carried with a Branch during Peer synchronization. */
+export interface SessionTransferMetadata {
+  readonly sessionId: string
+  readonly workstreamId: string
+  readonly title: string
+  readonly createdAt: string
+  readonly updatedAt: string
+  readonly peerId: string
+  readonly createdEventId: string
+  readonly settledAt: string | null
+  readonly settledEventId: string | null
+}
+
+/** The immutable context closure exchanged between two Peers. */
+export interface SyncBundle {
+  readonly version: 1
+  readonly sourcePeerId: string
+  readonly workstream: Workstream
+  readonly session: SessionTransferMetadata
+  readonly branchHeadId: string | null
+  readonly records: ReadonlyArray<BranchRecord>
+}
+
+export interface SyncResult {
+  readonly sessionId: string
+  readonly workstreamId: string
+  readonly branchHeadId: string | null
+  readonly importedRecordIds: ReadonlyArray<string>
+  readonly existingRecordIds: ReadonlyArray<string>
+  readonly importedCommitIds: ReadonlyArray<string>
+  readonly existingCommitIds: ReadonlyArray<string>
+}
+
 export const WorkstreamSchema = Schema.Struct({
   workstreamId: Schema.String,
   name: Schema.String,
@@ -447,6 +504,37 @@ export const WorkstreamSnapshotSchema = Schema.Struct({
   sessions: Schema.Array(SessionSummarySchema)
 })
 
+export const SessionTransferMetadataSchema = Schema.Struct({
+  sessionId: Schema.String,
+  workstreamId: Schema.String,
+  title: Schema.String,
+  createdAt: Schema.String,
+  updatedAt: Schema.String,
+  peerId: Schema.String,
+  createdEventId: Schema.String,
+  settledAt: Schema.NullOr(Schema.String),
+  settledEventId: Schema.NullOr(Schema.String)
+})
+
+export const SyncBundleSchema = Schema.Struct({
+  version: Schema.Literal(1),
+  sourcePeerId: Schema.String,
+  workstream: WorkstreamSchema,
+  session: SessionTransferMetadataSchema,
+  branchHeadId: Schema.NullOr(Schema.String),
+  records: Schema.Array(BranchRecordSchema)
+})
+
+export const SyncResultSchema = Schema.Struct({
+  sessionId: Schema.String,
+  workstreamId: Schema.String,
+  branchHeadId: Schema.NullOr(Schema.String),
+  importedRecordIds: Schema.Array(Schema.String),
+  existingRecordIds: Schema.Array(Schema.String),
+  importedCommitIds: Schema.Array(Schema.String),
+  existingCommitIds: Schema.Array(Schema.String)
+})
+
 export const isCommit = (item: HistoryItem): item is Commit =>
   item.type === "UserCommit" ||
   item.type === "ToolCommit" ||
@@ -460,6 +548,17 @@ export const isBranchRecord = (item: HistoryItem): item is BranchRecord =>
 
 export const branchRecordId = (record: BranchRecord): string =>
   record.type === "LegacyToolCall" ? record.legacyId : record.commitId
+
+const commitIdsFor = (
+  records: ReadonlyArray<BranchRecord>,
+  recordIds: ReadonlyArray<string>
+): ReadonlyArray<string> => {
+  const selectedIds = new Set(recordIds)
+  return records
+    .filter((record) => selectedIds.has(branchRecordId(record)))
+    .filter(isCommit)
+    .map((record) => record.commitId)
+}
 
 export const historyItemId = (item: HistoryItem): string => {
   if (isCommit(item)) return item.commitId
@@ -628,6 +727,15 @@ export interface Interface {
     runId?: string,
     peerId?: string
   ) => Effect.Effect<Extract<Commit, { readonly type: "InterruptCommit" }>, Error>
+  readonly exportBranch: (
+    sessionId: string,
+    headId?: string | null,
+    peerId?: string
+  ) => Effect.Effect<SyncBundle, Error>
+  readonly importBranch: (
+    bundle: SyncBundle,
+    peerId?: string
+  ) => Effect.Effect<SyncResult, Error>
   readonly cherryPick: (
     /** The canonical order is source Session, source Commit, target Session. */
     sourceSessionId: string,
@@ -682,6 +790,19 @@ interface EventRow {
 
 const persistenceError = (cause: unknown) =>
   new PersistenceError({ message: cause instanceof Error ? cause.message : String(cause) })
+
+const preserveSessionError = <A, E>(
+  effect: Effect.Effect<A, E>
+): Effect.Effect<A, PersistenceError | Error> =>
+  effect.pipe(Effect.mapError((cause) => {
+    if (cause !== null && typeof cause === "object" && "_tag" in cause) {
+      const tag = (cause as { readonly _tag?: unknown })._tag
+      if (typeof tag === "string" && tag.startsWith("@corredor/Session/")) {
+        return cause as unknown as Error
+      }
+    }
+    return persistenceError(cause)
+  }))
 
 const decodeCommitProvenance = (value: unknown): CommitProvenance | undefined => {
   if (value === null || typeof value !== "object") return undefined
@@ -763,6 +884,7 @@ const decodeHistory = (rows: ReadonlyArray<EventRow>): ReadonlyArray<HistoryItem
         createdAt,
         content: String(payload.content ?? ""),
         ...(typeof payload.peerId === "string" ? { peerId: payload.peerId } : {}),
+        ...(payload.imported === true ? { imported: true } : {}),
         ...(row.event_type === "UserMessageAdded" &&
           typeof payload.messageId === "string"
           ? { legacyMessageId: payload.messageId }
@@ -891,6 +1013,132 @@ const decodeHistory = (rows: ReadonlyArray<EventRow>): ReadonlyArray<HistoryItem
   return items
 }
 
+const syncRecordPayload = (
+  record: BranchRecord
+): { readonly type: RawEventType; readonly payload: Record<string, unknown> } => {
+  // `imported` is local runtime state, never part of the synchronized identity.
+  if (record.type === "LegacyToolCall") {
+    return {
+      type: "AgentToolCallAdded",
+      payload: {
+        toolCallId: record.toolCallId,
+        name: record.name,
+        input: record.input,
+        inReplyTo: record.inReplyTo,
+        index: record.index,
+        parentId: record.parentId
+      }
+    }
+  }
+
+  if (record.type === "UserCommit") {
+    return {
+      type: record.legacyMessageId === undefined
+        ? "UserCommit"
+        : "UserMessageAdded",
+      payload: {
+        content: record.content,
+        parentId: record.parentId,
+        ...(record.peerId === undefined ? {} : { peerId: record.peerId }),
+        ...(record.legacyMessageId === undefined
+          ? {}
+          : { messageId: record.legacyMessageId })
+      }
+    }
+  }
+
+  if (record.type === "ToolCommit") {
+    return {
+      type: "ToolCommit",
+      payload: {
+        toolCallId: record.toolCallId,
+        name: record.name,
+        input: record.input,
+        outcome: record.outcome,
+        inReplyTo: record.inReplyTo,
+        index: record.index,
+        parentId: record.parentId,
+        ...(record.runId === undefined ? {} : { runId: record.runId })
+      }
+    }
+  }
+
+  if (record.type === "AgentMessageCommit") {
+    return {
+      type: record.legacyMessageId === undefined
+        ? "AgentMessageCommit"
+        : "AgentMessageAdded",
+      payload: {
+        content: record.content,
+        inReplyTo: record.inReplyTo,
+        parentId: record.parentId,
+        ...(record.runId === undefined ? {} : { runId: record.runId }),
+        ...(record.legacyMessageId === undefined
+          ? {}
+          : { messageId: record.legacyMessageId }),
+        ...(record.provenance === undefined
+          ? {}
+          : { provenance: record.provenance })
+      }
+    }
+  }
+
+  if (record.type === "CompactionCommit") {
+    return {
+      type: "CompactionCommit",
+      payload: {
+        content: record.content,
+        inReplyTo: record.inReplyTo,
+        parentId: record.parentId,
+        ...(record.runId === undefined ? {} : { runId: record.runId })
+      }
+    }
+  }
+
+  if (record.type === "FailureCommit") {
+    return {
+      type: "FailureCommit",
+      payload: {
+        reason: record.reason,
+        inReplyTo: record.inReplyTo,
+        parentId: record.parentId,
+        ...(record.runId === undefined ? {} : { runId: record.runId })
+      }
+    }
+  }
+
+  return {
+    type: "InterruptCommit",
+    payload: {
+      reason: record.reason,
+      partialOutput: record.partialOutput,
+      inReplyTo: record.inReplyTo,
+      parentId: record.parentId,
+      ...(record.runId === undefined ? {} : { runId: record.runId })
+    }
+  }
+}
+
+const isBranchEventType = (type: RawEventType): boolean =>
+  type === "UserCommit" ||
+  type === "ToolCommit" ||
+  type === "AgentMessageCommit" ||
+  type === "AgentMessageAdded" ||
+  type === "CherryPickedAgentMessage" ||
+  type === "CompactionCommit" ||
+  type === "FailureCommit" ||
+  type === "InterruptCommit" ||
+  type === "UserMessageAdded" ||
+  type === "AgentToolCallAdded"
+
+const sameExpectedPayload = (
+  actual: Record<string, unknown>,
+  expected: Record<string, unknown>
+): boolean => Object.entries(expected).every(([key, value]) =>
+  Object.prototype.hasOwnProperty.call(actual, key) &&
+  isDeepStrictEqual(actual[key], value)
+)
+
 export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
   yield* Effect.try({
     try: () => mkdirSync(dirname(path), { recursive: true }),
@@ -911,6 +1159,40 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
 
   const sessionRows = (sessionId: string) =>
     sql<EventRow>`SELECT d.position, e.* FROM event_dispatch d JOIN session_events e ON e.event_id=d.event_id WHERE e.session_id=${sessionId} ORDER BY e.sequence`
+
+  const sessionMetadata = (sessionId: string) => sql<{
+    readonly sessionId: string
+    readonly workstreamId: string
+    readonly title: string
+    readonly createdAt: string
+    readonly updatedAt: string
+    readonly peerId: string
+    readonly settledAt: string | null
+  }>`SELECT
+    session_id AS sessionId,
+    workstream_id AS workstreamId,
+    title,
+    created_at AS createdAt,
+    updated_at AS updatedAt,
+    peer_id AS peerId,
+    settled_at AS settledAt
+  FROM sessions
+  WHERE session_id=${sessionId}`
+
+  const workstreamMetadata = (workstreamId: string) => sql<{
+    readonly workstreamId: string
+    readonly name: string
+    readonly createdAt: string
+    readonly updatedAt: string
+    readonly peerId: string
+  }>`SELECT
+    workstream_id AS workstreamId,
+    name,
+    created_at AS createdAt,
+    updated_at AS updatedAt,
+    peer_id AS peerId
+  FROM workstreams
+  WHERE workstream_id=${workstreamId}`
 
   const sessionSummaryRows = (workstreamId?: string) => workstreamId === undefined
     ? sql<{
@@ -1023,6 +1305,23 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     yield* sql`UPDATE workstreams SET updated_at=${occurredAt}
       WHERE workstream_id=(SELECT workstream_id FROM sessions WHERE session_id=${sessionId})`
     return decodeHistory([row])[0]!
+  })
+
+  const insertRawEvent = (
+    sessionId: string,
+    eventId: string,
+    type: RawEventType,
+    payload: Record<string, unknown>,
+    sequence: number,
+    occurredAt: string
+  ) => Effect.gen(function*() {
+    yield* sql`INSERT INTO session_events (
+      event_id, session_id, sequence, event_type, payload, occurred_at
+    ) VALUES (
+      ${eventId}, ${sessionId}, ${sequence}, ${type},
+      ${JSON.stringify(payload)}, ${occurredAt}
+    )`
+    yield* sql`INSERT INTO event_dispatch (event_id) VALUES (${eventId})`
   })
 
   const ensurePeerHead = (sessionId: string, peerId: string) => sql`
@@ -1186,6 +1485,422 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
     yield* updateHeadIfCurrent(sessionId, peerId, inReplyTo, commitId)
     return item as Extract<Commit, { readonly type: "CompactionCommit" }>
   }).pipe(sql.withTransaction, persist)
+
+  const exportBranch = (
+    sessionId: string,
+    requestedHeadId: string | null | undefined,
+    requestedPeerId: string
+  ): Effect.Effect<SyncBundle, Error> => Effect.gen(function*() {
+    const rows = yield* sessionRows(sessionId)
+    if (rows.length === 0) return yield* new NotFound({ sessionId })
+    const session = (yield* sessionMetadata(sessionId))[0]
+    if (session === undefined) return yield* new NotFound({ sessionId })
+    const workstream = (yield* workstreamMetadata(session.workstreamId))[0]
+    if (workstream === undefined) {
+      return yield* new SyncValidationError({
+        message: `Session ${sessionId} references missing Workstream ${session.workstreamId}`
+      })
+    }
+
+    const history = decodeHistory(rows)
+    const heads = yield* sql<{ readonly commitId: string | null }>`
+      SELECT commit_id AS commitId
+      FROM peer_branch_heads
+      WHERE peer_id=${requestedPeerId} AND session_id=${sessionId}`
+    const branchHeadId = requestedHeadId === undefined
+      ? heads[0]?.commitId ?? null
+      : requestedHeadId
+    if (branchHeadId !== null && !history.some(
+      (item) => isBranchRecord(item) && branchRecordId(item) === branchHeadId
+    )) {
+      return yield* new CommitNotFound({
+        sessionId,
+        commitId: branchHeadId
+      })
+    }
+
+    const records = branchHistory(history, branchHeadId)
+    if (
+      branchHeadId !== null &&
+      (records.at(-1) === undefined ||
+        branchRecordId(records.at(-1)!) !== branchHeadId ||
+        records[0]?.parentId !== null)
+    ) {
+      return yield* new SyncValidationError({
+        message: `Branch Head ${branchHeadId} is not connected to its ancestry`
+      })
+    }
+    const createdEventId = rows.find(
+      (row) => row.event_type === "SessionCreated"
+    )?.event_id
+    if (createdEventId === undefined) {
+      return yield* new SyncValidationError({
+        message: `Session ${sessionId} has no creation activity`
+      })
+    }
+    const settledEventId = session.settledAt === null
+      ? null
+      : rows.filter((row) => row.event_type === "SessionSettled").at(-1)?.event_id ?? null
+
+    return {
+      version: 1 as const,
+      sourcePeerId: requestedPeerId,
+      workstream,
+      session: {
+        ...session,
+        createdEventId,
+        settledEventId
+      },
+      branchHeadId,
+      records
+    }
+  }).pipe(preserveSessionError)
+
+  const importBranch = (
+    bundle: SyncBundle,
+    requestedPeerId: string
+  ): Effect.Effect<SyncResult, Error> => Effect.gen(function*() {
+    if (bundle.version !== 1) {
+      return yield* new SyncValidationError({
+        message: `Unsupported synchronization version: ${String(bundle.version)}`
+      })
+    }
+    if (bundle.sourcePeerId.trim().length === 0) {
+      return yield* new SyncValidationError({
+        message: "Synchronization source Peer ID must not be empty"
+      })
+    }
+    if (bundle.session.sessionId.length === 0 ||
+      bundle.session.workstreamId.length === 0 ||
+      bundle.workstream.workstreamId.length === 0) {
+      return yield* new SyncValidationError({
+        message: "Synchronization metadata must identify a Session and Workstream"
+      })
+    }
+    if (bundle.session.workstreamId !== bundle.workstream.workstreamId) {
+      return yield* new SyncValidationError({
+        message: "Session and Workstream IDs do not match"
+      })
+    }
+    if (
+      bundle.session.settledAt !== null &&
+      bundle.session.settledEventId === null
+    ) {
+      return yield* new SyncValidationError({
+        message: "A settled Session must include its stable Settlement activity ID"
+      })
+    }
+
+    const incomingIds = new Set<string>()
+    for (const record of bundle.records) {
+      const recordId = branchRecordId(record)
+      if (recordId.length === 0) {
+        return yield* new SyncValidationError({
+          message: "Synchronization records must have stable IDs"
+        })
+      }
+      if (incomingIds.has(recordId)) {
+        return yield* new SyncValidationError({
+          message: `Synchronization payload repeats record ${recordId}`
+        })
+      }
+      incomingIds.add(recordId)
+      if (record.sessionId !== bundle.session.sessionId) {
+        return yield* new SyncValidationError({
+          message: `Record ${recordId} belongs to another Session`
+        })
+      }
+      if (recordId === bundle.session.createdEventId ||
+        recordId === bundle.session.settledEventId) {
+        return yield* new SyncValidationError({
+          message: `Record ${recordId} collides with Session lifecycle activity`
+        })
+      }
+    }
+
+    const lifecycleIds = [
+      { id: bundle.session.createdEventId, type: "SessionCreated" as const },
+      ...(bundle.session.settledEventId === null
+        ? []
+        : [{ id: bundle.session.settledEventId, type: "SessionSettled" as const }])
+    ]
+    for (const lifecycle of lifecycleIds) {
+      if (lifecycle.id.length === 0) {
+        return yield* new SyncValidationError({
+          message: "Session lifecycle activity must have stable IDs"
+        })
+      }
+      const rows = yield* sql<{
+        readonly sessionId: string
+        readonly eventType: RawEventType
+      }>`SELECT session_id AS sessionId, event_type AS eventType
+        FROM session_events WHERE event_id=${lifecycle.id}`
+      const existing = rows[0]
+      if (existing !== undefined && (
+        existing.sessionId !== bundle.session.sessionId ||
+        existing.eventType !== lifecycle.type
+      )) {
+        return yield* new SyncConflict({
+          sessionId: bundle.session.sessionId,
+          recordId: lifecycle.id,
+          message: `Session lifecycle activity ${lifecycle.id} conflicts with an existing record`
+        })
+      }
+    }
+
+    const targetRowsBefore = yield* sessionRows(bundle.session.sessionId)
+    const targetHistoryBefore = decodeHistory(targetRowsBefore)
+    const available = new Set(
+      targetHistoryBefore
+        .filter(isBranchRecord)
+        .map(branchRecordId)
+    )
+    const existingRecords = new Map<string, {
+      readonly sessionId: string
+      readonly eventType: RawEventType
+      readonly payload: Record<string, unknown>
+      readonly occurredAt: string
+    }>()
+    for (const record of bundle.records) {
+      const recordId = branchRecordId(record)
+      const rows = yield* sql<{
+        readonly sessionId: string
+        readonly eventType: RawEventType
+        readonly payload: string
+        readonly occurredAt: string
+      }>`SELECT
+        session_id AS sessionId,
+        event_type AS eventType,
+        payload,
+        occurred_at AS occurredAt
+      FROM session_events
+      WHERE event_id=${recordId}`
+      const existing = rows[0]
+      if (existing === undefined) continue
+      const decodedPayload = JSON.parse(existing.payload) as Record<string, unknown>
+      const expected = syncRecordPayload(record)
+      const compatibleEventType = existing.eventType === expected.type ||
+        (record.type === "AgentMessageCommit" &&
+          (existing.eventType === "CherryPickedAgentMessage" ||
+            existing.eventType === "AgentMessageAdded"))
+      if (
+        existing.sessionId !== bundle.session.sessionId ||
+        !compatibleEventType ||
+        existing.occurredAt !== record.createdAt ||
+        !sameExpectedPayload(decodedPayload, expected.payload)
+      ) {
+        return yield* new SyncConflict({
+          sessionId: bundle.session.sessionId,
+          recordId,
+          message: `Record ${recordId} conflicts with an existing immutable record`
+        })
+      }
+      existingRecords.set(recordId, {
+        sessionId: existing.sessionId,
+        eventType: existing.eventType,
+        payload: decodedPayload,
+        occurredAt: existing.occurredAt
+      })
+    }
+
+    for (const record of bundle.records) {
+      if (record.parentId === null || incomingIds.has(record.parentId) ||
+        available.has(record.parentId)) continue
+      const parentRows = yield* sql<{
+        readonly sessionId: string
+        readonly eventType: RawEventType
+      }>`SELECT session_id AS sessionId, event_type AS eventType
+        FROM session_events WHERE event_id=${record.parentId}`
+      const parent = parentRows[0]
+      if (parent === undefined) {
+        return yield* new SyncValidationError({
+          message: `Record ${branchRecordId(record)} is missing parent ${record.parentId}`
+        })
+      }
+      if (
+        parent.sessionId !== bundle.session.sessionId ||
+        !isBranchEventType(parent.eventType)
+      ) {
+        return yield* new SyncValidationError({
+          message: `Record ${branchRecordId(record)} has a parent outside its Session`
+        })
+      }
+      available.add(record.parentId)
+    }
+
+    if (bundle.branchHeadId !== null && !incomingIds.has(bundle.branchHeadId) &&
+      !available.has(bundle.branchHeadId)) {
+      return yield* new SyncValidationError({
+        message: `Selected Branch Head ${bundle.branchHeadId} is not present in the import closure`
+      })
+    }
+
+    const preexistingWorkstream = (yield* workstreamMetadata(
+      bundle.workstream.workstreamId
+    ))[0]
+    if (preexistingWorkstream !== undefined && (
+      preexistingWorkstream.name !== bundle.workstream.name ||
+      preexistingWorkstream.createdAt !== bundle.workstream.createdAt ||
+      preexistingWorkstream.peerId !== bundle.workstream.peerId
+    )) {
+      return yield* new SyncConflict({
+        sessionId: bundle.session.sessionId,
+        recordId: bundle.workstream.workstreamId,
+        message: `Workstream ${bundle.workstream.workstreamId} has conflicting metadata`
+      })
+    }
+    const sessionRowsBefore = yield* sessionRows(bundle.session.sessionId)
+    const nextSessionSequence = sessionRowsBefore.reduce(
+      (maximum, row) => Math.max(maximum, row.sequence),
+      0
+    ) + 1
+    const preexistingSession = (yield* sessionMetadata(bundle.session.sessionId))[0]
+    if (preexistingSession !== undefined && (
+      preexistingSession.workstreamId !== bundle.session.workstreamId ||
+      preexistingSession.createdAt !== bundle.session.createdAt ||
+      preexistingSession.peerId !== bundle.session.peerId
+    )) {
+      return yield* new SyncConflict({
+        sessionId: bundle.session.sessionId,
+        recordId: bundle.session.sessionId,
+        message: `Session ${bundle.session.sessionId} has conflicting metadata`
+      })
+    }
+
+    const workstreamRows = yield* workstreamMetadata(bundle.workstream.workstreamId)
+    const existingWorkstream = workstreamRows[0]
+    if (existingWorkstream === undefined) {
+      yield* sql`INSERT INTO workstreams (
+        workstream_id, name, created_at, updated_at, peer_id
+      ) VALUES (
+        ${bundle.workstream.workstreamId},
+        ${bundle.workstream.name},
+        ${bundle.workstream.createdAt},
+        ${bundle.workstream.updatedAt},
+        ${bundle.workstream.peerId}
+      )`
+    }
+
+    const existingSession = preexistingSession
+    if (existingSession === undefined) {
+      yield* sql`INSERT INTO sessions (
+        session_id, workstream_id, title, created_at, updated_at, peer_id, settled_at
+      ) VALUES (
+        ${bundle.session.sessionId},
+        ${bundle.session.workstreamId},
+        ${bundle.session.title},
+        ${bundle.session.createdAt},
+        ${bundle.session.updatedAt},
+        ${bundle.session.peerId},
+        ${bundle.session.settledAt}
+      )`
+      yield* insertRawEvent(
+        bundle.session.sessionId,
+        bundle.session.createdEventId,
+        "SessionCreated",
+        { workstreamId: bundle.session.workstreamId },
+        1,
+        bundle.session.createdAt
+      )
+      if (bundle.session.settledAt !== null) {
+        yield* insertRawEvent(
+          bundle.session.sessionId,
+          bundle.session.settledEventId!,
+          "SessionSettled",
+          {},
+          2,
+          bundle.session.settledAt
+        )
+      }
+    } else {
+      yield* sql`UPDATE sessions SET
+        updated_at=CASE WHEN updated_at < ${bundle.session.updatedAt}
+          THEN ${bundle.session.updatedAt} ELSE updated_at END,
+        title=CASE WHEN title='New session' AND ${bundle.session.title} <> 'New session'
+          THEN ${bundle.session.title} ELSE title END,
+        settled_at=CASE
+          WHEN settled_at IS NULL AND ${bundle.session.settledAt} IS NOT NULL
+            THEN ${bundle.session.settledAt}
+          ELSE settled_at
+        END
+      WHERE session_id=${bundle.session.sessionId}`
+
+      if (
+        existingSession.settledAt === null &&
+        bundle.session.settledAt !== null &&
+        bundle.session.settledEventId !== null &&
+        sessionRowsBefore.every(
+          (row) => row.event_id !== bundle.session.settledEventId
+        )
+      ) {
+        yield* insertRawEvent(
+          bundle.session.sessionId,
+          bundle.session.settledEventId,
+          "SessionSettled",
+          {},
+          nextSessionSequence,
+          bundle.session.settledAt
+        )
+      }
+    }
+
+    let nextSequence = (yield* sql<{ readonly maximum: number | null }>`
+      SELECT MAX(sequence) AS maximum
+      FROM session_events
+      WHERE session_id=${bundle.session.sessionId}`)[0]?.maximum ?? 0
+    const pending = bundle.records.filter(
+      (record) => !existingRecords.has(branchRecordId(record))
+    )
+    const importedRecordIds: Array<string> = []
+    const existingRecordIds = bundle.records
+      .filter((record) => existingRecords.has(branchRecordId(record)))
+      .map(branchRecordId)
+
+    while (pending.length > 0) {
+      const index = pending.findIndex(
+        (record) => record.parentId === null || available.has(record.parentId)
+      )
+      if (index < 0) {
+        return yield* new SyncValidationError({
+          message: "Synchronization records do not form a closed ancestry"
+        })
+      }
+      const record = pending.splice(index, 1)[0]!
+      const recordId = branchRecordId(record)
+      const event = syncRecordPayload(record)
+      const payload = record.type === "UserCommit"
+        ? { ...event.payload, imported: true }
+        : event.payload
+      nextSequence += 1
+      yield* insertRawEvent(
+        bundle.session.sessionId,
+        recordId,
+        event.type,
+        payload,
+        nextSequence,
+        record.createdAt
+      )
+      available.add(recordId)
+      importedRecordIds.push(recordId)
+    }
+
+    const importedCommitIds = commitIdsFor(bundle.records, importedRecordIds)
+    const existingCommitIds = commitIdsFor(bundle.records, existingRecordIds)
+
+    yield* sql`UPDATE workstreams SET
+      updated_at=CASE WHEN updated_at < ${bundle.workstream.updatedAt}
+        THEN ${bundle.workstream.updatedAt} ELSE updated_at END
+    WHERE workstream_id=${bundle.workstream.workstreamId}`
+    return {
+      sessionId: bundle.session.sessionId,
+      workstreamId: bundle.workstream.workstreamId,
+      branchHeadId: bundle.branchHeadId,
+      importedRecordIds,
+      existingRecordIds,
+      importedCommitIds,
+      existingCommitIds
+    }
+  }).pipe(sql.withTransaction, preserveSessionError)
 
   const cherryPick = (
     sourceSessionId: string,
@@ -1665,6 +2380,19 @@ export const make = (path = defaultDatabasePath) => Effect.gen(function*() {
         >
       }
     ),
+    exportBranch: Effect.fn("Session.exportBranch")(function*(
+      sessionId,
+      headId,
+      requestedPeerId = defaultPeerId
+    ) {
+      return yield* exportBranch(sessionId, headId, requestedPeerId)
+    }),
+    importBranch: Effect.fn("Session.importBranch")(function*(
+      bundle,
+      requestedPeerId = defaultPeerId
+    ) {
+      return yield* importBranch(bundle, requestedPeerId)
+    }),
     cherryPick: Effect.fn("Session.cherryPick")(function*(
       sourceSessionId,
       sourceCommitId,
