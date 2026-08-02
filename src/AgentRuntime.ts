@@ -89,7 +89,8 @@ export const isRunnableUserCommit = (
 ): item is Extract<Session.Commit, { readonly type: "UserCommit" }> =>
   item.type === "UserCommit" &&
   item.legacyMessageId === undefined &&
-  item.imported !== true
+  item.imported !== true &&
+  item.autoRun !== false
 
 const agentContext = (
   history: ReadonlyArray<Session.HistoryItem>,
