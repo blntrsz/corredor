@@ -41,6 +41,31 @@ export interface FocusedSession extends FocusedSessionRoot {
   readonly outcome: TerminalCommit
 }
 
+export interface CodeReviewInput {
+  /** Explicit instructions recorded as the review Session's root User Commit. */
+  readonly reviewInstructions: string
+  /** Explicit User Commit content supplied to the fixer after Integration. */
+  readonly remediationInstructions: string
+  readonly settlement: IntegrationChoice
+  readonly reviewSessionId?: string
+  readonly reviewRootCommitId?: string
+  readonly reviewRunId?: string
+  readonly integrationRunId?: string
+  readonly remediationCommitId?: string
+  readonly fixerRunId?: string
+  readonly fixer?: Agent.Definition
+}
+
+export interface CodeReviewResult {
+  readonly review: FocusedSession
+  readonly integration: IntegrationResult
+  readonly remediation: Extract<
+    Session.Commit,
+    { readonly type: "UserCommit" }
+  >
+  readonly fixer: TerminalCommit
+}
+
 export const integrationChoices = Application.integrationChoices
 export type IntegrationChoice = Application.IntegrationChoice
 
@@ -89,7 +114,8 @@ export interface Context {
     sessionId: string,
     startingCommitId: string,
     runId?: string,
-    peerId?: string
+    peerId?: string,
+    agent?: Agent.Definition
   ) => Effect.Effect<TerminalCommit, Error>
   readonly integrate: (
     input: IntegrationInput
@@ -116,6 +142,11 @@ export interface Interface {
     invocation: Invocation,
     input: IntegrationInput
   ) => Effect.Effect<IntegrationResult, Error>
+  /** Reviews the current Branch, integrates findings, and starts remediation. */
+  readonly codeReview: (
+    invocation: Invocation,
+    input: CodeReviewInput
+  ) => Effect.Effect<CodeReviewResult, Error>
 }
 
 export class Service extends Context.Service<Service, Interface>()(
@@ -218,12 +249,13 @@ export const make = Effect.gen(function*() {
       sessionId: string,
       startingCommitId: string,
       runId: string | undefined,
-      peerId: string | undefined
+      peerId: string | undefined,
+      agent?: Agent.Definition
     ) {
       yield* application.startAgentRun(
         sessionId,
         startingCommitId,
-        invocation.agent,
+        agent ?? invocation.agent,
         runId,
         peerId
       )
@@ -311,12 +343,13 @@ export const make = Effect.gen(function*() {
           resolved,
           input
         ),
-        runAgent: (sessionId, startingCommitId, runId, peerId) => runAgent(
+        runAgent: (sessionId, startingCommitId, runId, peerId, agent) => runAgent(
           invocation,
           sessionId,
           startingCommitId,
           runId,
-          peerId
+          peerId,
+          agent
         ),
         integrate: (input) => application.integrate({
           ...input,
@@ -340,7 +373,43 @@ export const make = Effect.gen(function*() {
     }
   )
 
-  return Service.of({ invoke, runFocused, integrate })
+  const codeReview: Interface["codeReview"] = Effect.fn("Workflow.codeReview")(
+    function*(invocation, input) {
+      return yield* invoke(invocation, (context) => Effect.gen(function*() {
+        const review = yield* context.runFocused({
+          rootContext: input.reviewInstructions,
+          sessionId: input.reviewSessionId,
+          rootCommitId: input.reviewRootCommitId,
+          runId: input.reviewRunId
+        })
+        const integration = yield* context.integrate({
+          sourceSessionId: review.session.sessionId,
+          sourceBranchHeadId: review.outcome.commitId,
+          targetSessionId: invocation.sessionId,
+          targetBranchHeadId: invocation.startingCommitId,
+          settlement: input.settlement,
+          runId: input.integrationRunId
+        })
+        const remediation = yield* context.application.submitUserCommit(
+          invocation.sessionId,
+          input.remediationInstructions,
+          input.remediationCommitId,
+          invocation.peerId,
+          { autoRun: false }
+        )
+        const fixerOutcome = yield* context.runAgent(
+          invocation.sessionId,
+          remediation.commitId,
+          input.fixerRunId,
+          invocation.peerId,
+          input.fixer
+        )
+        return { review, integration, remediation, fixer: fixerOutcome }
+      }))
+    }
+  )
+
+  return Service.of({ invoke, runFocused, integrate, codeReview })
 })
 
 export const layerWithoutDependencies = Layer.effect(Service, make)
