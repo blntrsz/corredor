@@ -68,6 +68,15 @@ export interface Interface {
     Extract<Session.Commit, { readonly type: "InterruptCommit" }> | undefined,
     Session.Error | Session.PersistenceError
   >
+  readonly exportBranch: (
+    sessionId: string,
+    headId?: string | null,
+    peerId?: string
+  ) => Effect.Effect<Session.SyncBundle, Session.Error>
+  readonly importBranch: (
+    bundle: Session.SyncBundle,
+    peerId?: string
+  ) => Effect.Effect<Session.SyncResult, Session.Error>
   readonly cherryPick: (
     sourceSessionId: string,
     sourceCommitId: string,
@@ -211,6 +220,19 @@ export const make = Effect.gen(function*() {
         )
       }
     ),
+    exportBranch: Effect.fn("Application.exportBranch")(function* (
+      sessionId: string,
+      headId?: string | null,
+      peerId?: string
+    ) {
+      return yield* store.exportBranch(sessionId, headId, peerId)
+    }),
+    importBranch: Effect.fn("Application.importBranch")(function* (
+      bundle: Session.SyncBundle,
+      peerId?: string
+    ) {
+      return yield* store.importBranch(bundle, peerId)
+    }),
     cherryPick: Effect.fn("Application.cherryPick")(function*(
       sourceSessionId: string,
       sourceCommitId: string,

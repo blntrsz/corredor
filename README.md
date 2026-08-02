@@ -151,6 +151,12 @@ endpoint returns the Workstream together with its Session summaries. Existing
 Sessions are linked to `default-workstream` during migration without rewriting
 their history.
 
+Peers exchange context through the public Push/Pull boundary. Configure the
+remote Peer explicitly with its base URL and Peer ID; synchronization transfers
+only the selected Branch closure and leaves the receiving local Branch Head
+unchanged. The HTTP transport is exposed as `GET /v1/sync/export/:sessionId`
+and `POST /v1/sync/import` for clients that provide their own transport.
+
 Legacy user and Agent messages are projected as canonical Commits when read.
 Legacy tool-call-only and navigation records remain inspectable without
 rewriting their stored rows.

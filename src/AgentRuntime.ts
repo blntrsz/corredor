@@ -83,11 +83,13 @@ const safeFailureReason = (cause: Cause.Cause<unknown>): string => {
   return defaultFailureReason
 }
 
-/** Legacy projected users are readable history, not new work to execute. */
+/** Legacy and synchronized users are readable history, not new work to execute. */
 export const isRunnableUserCommit = (
   item: Session.HistoryItem
 ): item is Extract<Session.Commit, { readonly type: "UserCommit" }> =>
-  item.type === "UserCommit" && item.legacyMessageId === undefined
+  item.type === "UserCommit" &&
+  item.legacyMessageId === undefined &&
+  item.imported !== true
 
 const agentContext = (
   history: ReadonlyArray<Session.HistoryItem>,

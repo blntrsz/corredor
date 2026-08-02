@@ -13,6 +13,12 @@ export class ProxyError extends Schema.TaggedErrorClass<ProxyError>()(
   { message: Schema.String }
 ) {}
 
+/** Explicit address and identity of the Peer used for Push/Pull transport. */
+export interface PeerEndpoint {
+  readonly baseUrl: string
+  readonly peerId: string
+}
+
 export interface Interface {
   readonly createWorkstream: (
     workstreamId?: string,
@@ -86,6 +92,23 @@ export interface Interface {
   readonly history: (
     sessionId: string
   ) => Effect.Effect<Session.HistorySnapshot, ProxyError>
+  readonly exportBranch: (
+    sessionId: string,
+    headId?: string | null
+  ) => Effect.Effect<Session.SyncBundle, ProxyError>
+  readonly importBranch: (
+    bundle: Session.SyncBundle
+  ) => Effect.Effect<Session.SyncResult, ProxyError>
+  readonly push: (
+    sessionId: string,
+    remote: PeerEndpoint,
+    headId?: string | null
+  ) => Effect.Effect<Session.SyncResult, ProxyError>
+  readonly pull: (
+    sessionId: string,
+    remote: PeerEndpoint,
+    headId?: string | null
+  ) => Effect.Effect<Session.SyncResult, ProxyError>
   readonly checkout: (
     sessionId: string,
     commitId: string | null
@@ -124,6 +147,12 @@ const LifecycleResponse = Schema.Union([
   Schema.Struct({ event: Session.SessionSettledSchema }),
   Schema.Struct({ event: Session.SessionReopenedSchema })
 ])
+const SyncBundleResponse = Schema.Struct({
+  bundle: Session.SyncBundleSchema
+})
+const SyncResultResponse = Schema.Struct({
+  result: Session.SyncResultSchema
+})
 
 const proxyError = (cause: unknown): ProxyError => new ProxyError({
   message: cause instanceof Error ? cause.message : String(cause)
@@ -169,9 +198,15 @@ export const make = (
   peerId = Session.defaultPeerId
 ) => Effect.gen(function*() {
   const client = yield* HttpClient.HttpClient
-  const url = (path: string): string => `${baseUrl}${path}`
-  const withPeer = (request: HttpClientRequest.HttpClientRequest) =>
-    request.pipe(HttpClientRequest.setHeader("x-corredor-peer-id", peerId))
+  const normalizedBaseUrl = (value: string): string => value.replace(/\/+$/, "")
+  const url = (path: string): string => `${normalizedBaseUrl(baseUrl)}${path}`
+  const localPeer: PeerEndpoint = { baseUrl, peerId }
+  const withPeer = (
+    request: HttpClientRequest.HttpClientRequest,
+    requestedPeerId = peerId
+  ) => request.pipe(
+    HttpClientRequest.setHeader("x-corredor-peer-id", requestedPeerId)
+  )
 
   const execute = (request: HttpClientRequest.HttpClientRequest) =>
     client.execute(request).pipe(Effect.mapError(proxyError))
@@ -210,6 +245,39 @@ export const make = (
       return yield* requireSuccess(yield* execute(request), "Activity stream")
     }
   )
+
+  const exportFromPeer = Effect.fn("AgentProxy.exportFromPeer")(function*(
+    endpoint: PeerEndpoint,
+    sessionId: string,
+    headId?: string | null
+  ) {
+    const query = headId === undefined
+      ? ""
+      : `?headId=${encodeURIComponent(headId ?? "")}`
+    const body = yield* responseJson(withPeer(
+      HttpClientRequest.get(
+        `${normalizedBaseUrl(endpoint.baseUrl)}/v1/sync/export/${encodeURIComponent(sessionId)}${query}`
+      ),
+      endpoint.peerId
+    ))
+    const decoded = yield* Schema.decodeUnknownEffect(SyncBundleResponse)(body)
+      .pipe(Effect.mapError(proxyError))
+    return decoded.bundle as Session.SyncBundle
+  })
+
+  const importToPeer = Effect.fn("AgentProxy.importToPeer")(function*(
+    endpoint: PeerEndpoint,
+    bundle: Session.SyncBundle
+  ) {
+    const body = yield* responseJson(withPeer(
+      HttpClientRequest.post(`${normalizedBaseUrl(endpoint.baseUrl)}/v1/sync/import`)
+        .pipe(HttpClientRequest.bodyJsonUnsafe(bundle)),
+      endpoint.peerId
+    ))
+    const decoded = yield* Schema.decodeUnknownEffect(SyncResultResponse)(body)
+      .pipe(Effect.mapError(proxyError))
+    return decoded.result as Session.SyncResult
+  })
 
   return Service.of({
     createWorkstream: Effect.fn("AgentProxy.createWorkstream")(
@@ -401,6 +469,37 @@ export const make = (
       const decoded = yield* Schema.decodeUnknownEffect(HistoryResponse)(body)
         .pipe(Effect.mapError(proxyError))
       return decoded.history as Session.HistorySnapshot
+    }),
+    exportBranch: Effect.fn("AgentProxy.exportBranch")(function*(
+      sessionId: string,
+      headId?: string | null
+    ) {
+      return yield* exportFromPeer(localPeer, sessionId, headId)
+    }),
+    importBranch: Effect.fn("AgentProxy.importBranch")(function*(
+      bundle: Session.SyncBundle
+    ) {
+      return yield* importToPeer(localPeer, bundle)
+    }),
+    push: Effect.fn("AgentProxy.push")(function*(
+      sessionId: string,
+      remote: PeerEndpoint,
+      headId?: string | null
+    ) {
+      const bundle = yield* exportFromPeer(localPeer, sessionId, headId)
+      return yield* importToPeer(remote, bundle)
+    }),
+    pull: Effect.fn("AgentProxy.pull")(function*(
+      sessionId: string,
+      remote: PeerEndpoint,
+      headId?: string | null
+    ) {
+      const bundle = yield* exportFromPeer(
+        remote,
+        sessionId,
+        headId
+      )
+      return yield* importToPeer(localPeer, bundle)
     }),
     checkout: Effect.fn("AgentProxy.checkout")(function*(
       sessionId: string,
