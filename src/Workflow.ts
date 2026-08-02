@@ -41,6 +41,14 @@ export interface FocusedSession extends FocusedSessionRoot {
   readonly outcome: TerminalCommit
 }
 
+export const integrationChoices = Application.integrationChoices
+export type IntegrationChoice = Application.IntegrationChoice
+
+/** Selected source and target Branch Heads for a cross-Session handoff. */
+export type IntegrationInput = Application.IntegrationInput
+
+export type IntegrationResult = Application.IntegrationResult
+
 export class InvalidInvocation extends Schema.TaggedErrorClass<InvalidInvocation>()(
   "@corredor/Workflow/InvalidInvocation",
   {
@@ -59,7 +67,12 @@ export class OutcomeTimeout extends Schema.TaggedErrorClass<OutcomeTimeout>()(
   }
 ) {}
 
-export type Error = Session.Error | Session.PersistenceError | InvalidInvocation | OutcomeTimeout
+export type Error =
+  | Session.Error
+  | Session.PersistenceError
+  | Application.InvalidIntegration
+  | InvalidInvocation
+  | OutcomeTimeout
 
 export interface Context {
   readonly invocation: Invocation
@@ -78,6 +91,9 @@ export interface Context {
     runId?: string,
     peerId?: string
   ) => Effect.Effect<TerminalCommit, Error>
+  readonly integrate: (
+    input: IntegrationInput
+  ) => Effect.Effect<IntegrationResult, Error>
 }
 
 export interface Interface {
@@ -95,6 +111,11 @@ export interface Interface {
     invocation: Invocation,
     input: FocusedSessionInput
   ) => Effect.Effect<FocusedSession, Error>
+  /** Compacts a source Branch, Cherry-picks it into a target, and optionally settles the source. */
+  readonly integrate: (
+    invocation: Invocation,
+    input: IntegrationInput
+  ) => Effect.Effect<IntegrationResult, Error>
 }
 
 export class Service extends Context.Service<Service, Interface>()(
@@ -296,7 +317,12 @@ export const make = Effect.gen(function*() {
           startingCommitId,
           runId,
           peerId
-        )
+        ),
+        integrate: (input) => application.integrate({
+          ...input,
+          agent: input.agent ?? invocation.agent,
+          peerId: input.peerId ?? invocation.peerId
+        })
       }
       return yield* program(context)
     }
@@ -308,7 +334,13 @@ export const make = Effect.gen(function*() {
     }
   )
 
-  return Service.of({ invoke, runFocused })
+  const integrate: Interface["integrate"] = Effect.fn("Workflow.integrate")(
+    function*(invocation, input) {
+      return yield* invoke(invocation, (context) => context.integrate(input))
+    }
+  )
+
+  return Service.of({ invoke, runFocused, integrate })
 })
 
 export const layerWithoutDependencies = Layer.effect(Service, make)

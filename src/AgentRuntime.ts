@@ -416,7 +416,8 @@ export const make = Effect.gen(function*() {
         summary,
         startingCommitId,
         requestedRunId,
-        requestedPeerId
+        requestedPeerId,
+        startingCommitId
       )
     }
   )

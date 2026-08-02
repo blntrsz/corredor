@@ -680,3 +680,109 @@ it.live(
     ])
   })
 )
+
+it.live(
+  "integrates selected Branch Heads through HTTP with an explicit source choice",
+  () => Effect.gen(function*() {
+    const { path } = yield* temporaryDatabase("corredor-http-integration-")
+    const port = yield* Effect.promise(availablePort)
+    const baseUrl = `http://127.0.0.1:${port}`
+    let agentRuns = 0
+    const fakeAgent = Layer.succeed(Agent.Service, Agent.Service.of({
+      run: (_context, _onEvent, definition) => Effect.sync(() => {
+        agentRuns += 1
+        return definition?.id === "http-integration-compactor"
+          ? "HTTP integration summary"
+          : "initial Branch answer"
+      })
+    }))
+    const layer = Layer.mergeAll(
+      Server.layerWithoutDependencies({ host: "127.0.0.1", port }),
+      AgentProxy.layer({ baseUrl, peerId: "http-integration-peer" })
+    ).pipe(
+      Layer.provide(Session.layer(path)),
+      Layer.provide(fakeAgent)
+    )
+
+    const result = yield* Effect.gen(function*() {
+      const proxy = yield* AgentProxy.Service
+      const source = yield* proxy.createSession("http-integration-source")
+      const sourceRoot = yield* proxy.submitUserCommit(
+        source.sessionId,
+        "prepare source handoff",
+        "http-integration-source-user"
+      )
+      const target = yield* proxy.createSession("http-integration-target")
+      const targetRoot = yield* proxy.submitUserCommit(
+        target.sessionId,
+        "preserve target context",
+        "http-integration-target-user"
+      )
+
+      let sourceHistory = yield* proxy.history(source.sessionId)
+      let targetHistory = yield* proxy.history(target.sessionId)
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (
+          sourceHistory.items.some((item) => item.type === "AgentMessageCommit") &&
+          targetHistory.items.some((item) => item.type === "AgentMessageCommit")
+        ) break
+        yield* Effect.sleep("10 millis")
+        sourceHistory = yield* proxy.history(source.sessionId)
+        targetHistory = yield* proxy.history(target.sessionId)
+      }
+      if (sourceHistory.branchHeadId === null || targetHistory.branchHeadId === null) {
+        return yield* Effect.die("timed out waiting for HTTP Branch Heads")
+      }
+
+      const integration = yield* proxy.integrate({
+        sourceSessionId: source.sessionId,
+        sourceBranchHeadId: sourceHistory.branchHeadId,
+        targetSessionId: target.sessionId,
+        targetBranchHeadId: targetHistory.branchHeadId,
+        settlement: "integrate and settle",
+        agent: {
+          id: "http-integration-compactor",
+          instructions: "Summarize the source Branch.",
+          tools: []
+        },
+        runId: "http-integration-run"
+      })
+      sourceHistory = yield* proxy.history(source.sessionId)
+      targetHistory = yield* proxy.history(target.sessionId)
+      return {
+        sourceRoot,
+        targetRoot,
+        integration,
+        sourceHistory,
+        targetHistory
+      }
+    }).pipe(Effect.provide(layer))
+
+    expect(result.integration.compaction).toMatchObject({
+      type: "CompactionCommit",
+      content: "HTTP integration summary",
+      runId: "http-integration-run"
+    })
+    expect(result.integration.picked).toMatchObject({
+      type: "AgentMessageCommit",
+      content: "HTTP integration summary",
+      provenance: {
+        sessionId: "http-integration-source",
+        commitId: result.integration.compaction.commitId
+      }
+    })
+    expect(result.integration.settlement).toMatchObject({
+      type: "SessionSettled",
+      sessionId: "http-integration-source"
+    })
+    expect(result.sourceHistory.settled).toBe(true)
+    expect(result.targetHistory.settled).toBe(false)
+    expect(result.targetHistory.items.filter(
+      (item) => item.type === "AgentMessageCommit"
+    )).toHaveLength(2)
+    expect(result.targetHistory.items.some(
+      (item) => item.type === "CompactionCommit"
+    )).toBe(false)
+    expect(agentRuns).toBe(3)
+  })
+)

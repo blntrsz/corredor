@@ -73,6 +73,12 @@ curl -X POST http://127.0.0.1:5050/v1/sessions/$TARGET_SESSION_ID/cherry-pick \
   -H 'content-type: application/json' \
   -d '{"sourceSessionId":"SOURCE_SESSION_ID","sourceCommitId":"COMMIT_ID"}'
 
+# Integrate a source Branch into a selected target Branch. The only choices
+# are "integrate" and "integrate and settle"; the latter settles only source.
+curl -X POST http://127.0.0.1:5050/v1/sessions/$TARGET_SESSION_ID/integrate \
+  -H 'content-type: application/json' \
+  -d '{"sourceSessionId":"SOURCE_SESSION_ID","sourceBranchHeadId":"SOURCE_HEAD_ID","targetBranchHeadId":"TARGET_HEAD_ID","settlement":"integrate"}'
+
 # Interrupt the active Agent Run. The response contains the durable outcome.
 curl -X POST http://127.0.0.1:5050/v1/sessions/$SESSION_ID/interrupt \
   -H 'content-type: application/json' \
@@ -129,6 +135,11 @@ Cherry-pick copies an Agent Message Commit or Compaction Commit into the target
 Session as an Agent Message Commit whose `provenance` identifies the source
 Workstream, Session, and Commit. It never starts an Agent Run or deduplicates
 repeated picks.
+
+Integration compacts the selected source Branch, Cherry-picks that Compaction
+onto the selected target Branch, and optionally settles the source Session. The
+interactive client exposes this as `/integrate` with exactly the `integrate`
+and `integrate and settle` choices. It never starts an Agent Run on the target.
 
 Workstreams group related Sessions. Create one explicitly, or omit
 `workstreamId` when creating a Session to use the migration-safe default

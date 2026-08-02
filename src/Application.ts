@@ -1,8 +1,53 @@
 import { BunCrypto } from "@effect/platform-bun"
-import { Context, Crypto, Effect, Layer } from "effect"
+import { Context, Crypto, Effect, Layer, Schema } from "effect"
 import { Agent } from "./Agent.ts"
 import * as AgentRuntime from "./AgentRuntime.ts"
 import * as Session from "./Session.ts"
+
+/** The only successful Integration choices exposed to callers. */
+export const integrationChoices = [
+  "integrate",
+  "integrate and settle"
+] as const
+export type IntegrationChoice = typeof integrationChoices[number]
+
+export interface IntegrationInput {
+  readonly sourceSessionId: string
+  readonly sourceBranchHeadId: string
+  readonly targetSessionId: string
+  readonly targetBranchHeadId: string | null
+  readonly settlement: IntegrationChoice
+  readonly agent?: Agent.Definition
+  readonly runId?: string
+  readonly peerId?: string
+}
+
+export interface IntegrationResult {
+  readonly sourceSessionId: string
+  readonly sourceBranchHeadId: string
+  readonly targetSessionId: string
+  readonly targetBranchHeadId: string | null
+  readonly compaction: Extract<
+    Session.Commit,
+    { readonly type: "CompactionCommit" }
+  >
+  readonly picked: Extract<
+    Session.Commit,
+    { readonly type: "AgentMessageCommit" }
+  >
+  readonly settlement?: Session.SessionSettled
+}
+
+export class InvalidIntegration extends Schema.TaggedErrorClass<InvalidIntegration>()(
+  "@corredor/Application/InvalidIntegration",
+  {
+    sourceSessionId: Schema.String,
+    targetSessionId: Schema.String,
+    sourceBranchHeadId: Schema.String,
+    targetBranchHeadId: Schema.NullOr(Schema.String),
+    message: Schema.String
+  }
+) {}
 
 /**
  * Public application boundary shared by HTTP, interactive, and Workflow
@@ -92,10 +137,17 @@ export interface Interface {
     sourceSessionId: string,
     sourceCommitId: string,
     targetSessionId: string,
-    targetPeerId?: string
+    targetPeerId?: string,
+    expectedTargetHeadId?: string | null
   ) => Effect.Effect<
     Extract<Session.Commit, { readonly type: "AgentMessageCommit" }>,
     Session.Error
+  >
+  readonly integrate: (
+    input: IntegrationInput
+  ) => Effect.Effect<
+    IntegrationResult,
+    Session.Error | Session.PersistenceError | InvalidIntegration
   >
   readonly checkout: (
     sessionId: string,
@@ -132,6 +184,88 @@ export const make = Effect.gen(function*() {
       message: cause.message
     }))
   )
+
+  const integrate = Effect.fn("Application.integrate")(function*(
+    input: IntegrationInput
+  ) {
+    const peerId = input.peerId ?? Session.defaultPeerId
+    if (!(integrationChoices as ReadonlyArray<string>).includes(input.settlement)) {
+      return yield* new InvalidIntegration({
+        ...input,
+        message: "Integration choice must be exactly integrate or integrate and settle"
+      })
+    }
+    if (input.sourceSessionId === input.targetSessionId) {
+      return yield* new InvalidIntegration({
+        ...input,
+        message: "Integration requires distinct source and target Sessions"
+      })
+    }
+
+    const sourceHistory = yield* store.history(input.sourceSessionId, peerId)
+    const targetHistory = yield* store.history(input.targetSessionId, peerId)
+    const hasSession = (history: Session.HistorySnapshot): boolean =>
+      history.items.some((item) => item.type === "SessionCreated")
+    if (!hasSession(sourceHistory)) {
+      return yield* new Session.NotFound({ sessionId: input.sourceSessionId })
+    }
+    if (!hasSession(targetHistory)) {
+      return yield* new Session.NotFound({ sessionId: input.targetSessionId })
+    }
+    if (sourceHistory.branchHeadId !== input.sourceBranchHeadId) {
+      return yield* new InvalidIntegration({
+        ...input,
+        message: "Selected source Branch Head is not the local Branch Head"
+      })
+    }
+    if (targetHistory.branchHeadId !== input.targetBranchHeadId) {
+      return yield* new InvalidIntegration({
+        ...input,
+        message: "Selected target Branch Head is not the local Branch Head"
+      })
+    }
+
+    const compaction = yield* runtime.compact(
+      input.sourceSessionId,
+      input.sourceBranchHeadId,
+      input.agent,
+      input.runId,
+      peerId
+    ).pipe(
+      Effect.catchTag("@corredor/Session/BranchHeadConflict", () =>
+        Effect.fail(new InvalidIntegration({
+          ...input,
+          message: "Selected source Branch Head changed during Integration"
+        }))
+      )
+    )
+    const picked = yield* store.cherryPick(
+      input.sourceSessionId,
+      compaction.commitId,
+      input.targetSessionId,
+      peerId,
+      input.targetBranchHeadId
+    ).pipe(
+      Effect.catchTag("@corredor/Session/BranchHeadConflict", () =>
+        Effect.fail(new InvalidIntegration({
+          ...input,
+          message: "Selected target Branch Head changed during Integration"
+        }))
+      )
+    )
+    const settlement = input.settlement === "integrate and settle"
+      ? yield* store.settle(input.sourceSessionId)
+      : undefined
+    return {
+      sourceSessionId: input.sourceSessionId,
+      sourceBranchHeadId: input.sourceBranchHeadId,
+      targetSessionId: input.targetSessionId,
+      targetBranchHeadId: input.targetBranchHeadId,
+      compaction,
+      picked,
+      ...(settlement === undefined ? {} : { settlement })
+    }
+  })
 
   return Service.of({
     createWorkstream: Effect.fn("Application.createWorkstream")(
@@ -270,15 +404,18 @@ export const make = Effect.gen(function*() {
       sourceSessionId: string,
       sourceCommitId: string,
       targetSessionId: string,
-      targetPeerId?: string
+      targetPeerId?: string,
+      expectedTargetHeadId?: string | null
     ) {
       return yield* store.cherryPick(
         sourceSessionId,
         sourceCommitId,
         targetSessionId,
-        targetPeerId
+        targetPeerId,
+        expectedTargetHeadId
       )
     }),
+    integrate,
     checkout: Effect.fn("Application.checkout")(
       function*(sessionId: string, commitId: string | null, peerId?: string) {
         yield* store.checkout(sessionId, commitId, peerId)
